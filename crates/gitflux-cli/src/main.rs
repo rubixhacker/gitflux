@@ -5,8 +5,11 @@
 //! Render Configuration, GPU rendering, and Video Export orchestration.
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use gitflux_scene::{Layout, RenderConfiguration};
 
 const HELP: &str = "\
 Gitflux command-line interface
@@ -148,11 +151,34 @@ fn parse_render_args(args: impl IntoIterator<Item = String>) -> Result<RenderCom
         ));
     }
 
+    let render_configuration = load_render_configuration(config_path.as_ref())?;
+
     Ok(RenderCommand {
         repository_path,
         output_path,
         config_path,
+        render_configuration,
         json,
+    })
+}
+
+fn load_render_configuration(config_path: Option<&PathBuf>) -> Result<RenderConfiguration, String> {
+    let Some(config_path) = config_path else {
+        return Ok(RenderConfiguration::default());
+    };
+
+    let contents = fs::read_to_string(config_path).map_err(|error| {
+        format!(
+            "failed to read Render Configuration {}: {error}",
+            config_path.display()
+        )
+    })?;
+
+    RenderConfiguration::from_toml_str(&contents).map_err(|error| {
+        format!(
+            "failed to load Render Configuration {}:\n{error}",
+            config_path.display()
+        )
     })
 }
 
@@ -160,21 +186,42 @@ struct RenderCommand {
     repository_path: PathBuf,
     output_path: PathBuf,
     config_path: Option<PathBuf>,
+    render_configuration: RenderConfiguration,
     json: bool,
 }
 
 impl RenderCommand {
     fn render_configuration_label(&self) -> String {
-        self.config_path
+        let source = self
+            .config_path
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "defaults".to_owned())
+            .unwrap_or_else(|| "defaults".to_owned());
+        let frame_size = self.render_configuration.frame_size();
+        let layout_name = match self.render_configuration.layout() {
+            Layout::RepositoryGraph | Layout::RepositoryGraphWithParameters(_) => {
+                "Repository Graph"
+            }
+            Layout::Named(_) => "Named Layout",
+        };
+
+        format!(
+            "{} (theme: {}, {}x{}, {} FPS, layout: {})",
+            source,
+            self.render_configuration.theme().name(),
+            frame_size.width(),
+            frame_size.height(),
+            self.render_configuration.frames_per_second().get(),
+            layout_name
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::run;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn prints_help_by_default() {
@@ -276,8 +323,8 @@ mod tests {
     }
 
     #[test]
-    fn render_accepts_unparsed_configuration_path() {
-        let output = run([
+    fn render_rejects_missing_configuration_file() {
+        let error = run([
             "render".to_owned(),
             ".".to_owned(),
             "--output".to_owned(),
@@ -285,8 +332,95 @@ mod tests {
             "--config".to_owned(),
             "render.toml".to_owned(),
         ])
-        .expect("render tracer should accept config path");
+        .expect_err("missing Render Configuration file should fail");
 
-        assert!(output.contains("Render Configuration: render.toml"));
+        assert!(error.contains("failed to read Render Configuration render.toml"));
+    }
+
+    #[test]
+    fn render_loads_and_reports_configuration_file() {
+        let config_path = write_temp_render_config(
+            "valid",
+            r##"
+frame_width = 1280
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "terminal"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+"##,
+        );
+
+        let output = run([
+            "render".to_owned(),
+            ".".to_owned(),
+            "--output".to_owned(),
+            "out.mp4".to_owned(),
+            "--config".to_owned(),
+            config_path.display().to_string(),
+        ])
+        .expect("valid Render Configuration should load");
+
+        assert!(output.contains("Render Configuration:"));
+        assert!(output.contains("terminal"));
+        assert!(output.contains("1280x720"));
+        assert!(output.contains("30 FPS"));
+        assert!(output.contains("Repository Graph"));
+    }
+
+    #[test]
+    fn render_rejects_invalid_configuration_file_with_diagnostics() {
+        let config_path = write_temp_render_config(
+            "invalid",
+            r##"
+frame_width = 0
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "bad"
+background_color = "blue"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+"##,
+        );
+
+        let error = run([
+            "render".to_owned(),
+            ".".to_owned(),
+            "--output".to_owned(),
+            "out.mp4".to_owned(),
+            "--config".to_owned(),
+            config_path.display().to_string(),
+        ])
+        .expect_err("invalid Render Configuration should fail");
+
+        assert!(error.contains("invalid Render Configuration"));
+        assert!(error.contains("frame_width"));
+        assert!(error.contains("theme.background_color"));
+        assert!(error.contains("#RRGGBB"));
+    }
+
+    fn write_temp_render_config(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "gitflux-{name}-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::write(&path, contents).expect("temp Render Configuration should be written");
+        path
     }
 }
