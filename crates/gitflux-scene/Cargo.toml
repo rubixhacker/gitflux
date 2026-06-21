@@ -1,0 +1,6 @@
+[package]
+name = "gitflux-scene"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

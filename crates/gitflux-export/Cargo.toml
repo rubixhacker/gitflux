@@ -1,0 +1,10 @@
+[package]
+name = "gitflux-export"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gitflux-render.workspace = true
+
+[dev-dependencies]
+gitflux-scene.workspace = true

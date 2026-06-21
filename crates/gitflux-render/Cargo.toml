@@ -1,0 +1,7 @@
+[package]
+name = "gitflux-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gitflux-scene.workspace = true

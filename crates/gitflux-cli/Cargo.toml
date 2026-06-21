@@ -1,0 +1,10 @@
+[package]
+name = "gitflux-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gitflux"
+path = "src/main.rs"
+
+[dependencies]
