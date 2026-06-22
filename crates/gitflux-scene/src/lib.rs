@@ -347,6 +347,7 @@ impl RepositoryEntity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contributor {
     display_name: String,
+    identity_key: String,
     kind: ContributorKind,
 }
 
@@ -354,8 +355,23 @@ impl Contributor {
     /// Creates a human Contributor.
     #[must_use]
     pub fn human(display_name: impl Into<String>) -> Self {
+        let display_name = display_name.into();
+        Self {
+            identity_key: display_name.clone(),
+            display_name,
+            kind: ContributorKind::Human,
+        }
+    }
+
+    /// Creates a human Contributor with a stable normalized identity key.
+    #[must_use]
+    pub fn normalized_human(
+        display_name: impl Into<String>,
+        identity_key: impl Into<String>,
+    ) -> Self {
         Self {
             display_name: display_name.into(),
+            identity_key: identity_key.into(),
             kind: ContributorKind::Human,
         }
     }
@@ -363,8 +379,23 @@ impl Contributor {
     /// Creates an Automation Contributor.
     #[must_use]
     pub fn automation(display_name: impl Into<String>) -> Self {
+        let display_name = display_name.into();
+        Self {
+            identity_key: display_name.clone(),
+            display_name,
+            kind: ContributorKind::Automation,
+        }
+    }
+
+    /// Creates an Automation Contributor with a stable normalized identity key.
+    #[must_use]
+    pub fn normalized_automation(
+        display_name: impl Into<String>,
+        identity_key: impl Into<String>,
+    ) -> Self {
         Self {
             display_name: display_name.into(),
+            identity_key: identity_key.into(),
             kind: ContributorKind::Automation,
         }
     }
@@ -373,6 +404,12 @@ impl Contributor {
     #[must_use]
     pub fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    /// Returns the stable normalized identity key.
+    #[must_use]
+    pub fn identity_key(&self) -> &str {
+        &self.identity_key
     }
 
     /// Returns the Contributor kind.
