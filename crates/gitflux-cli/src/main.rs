@@ -23,7 +23,9 @@ use gitflux_preview::{
     PreviewWindowAdapter, PreviewWindowStatus,
 };
 use gitflux_render::{FrameCount, OffscreenRenderer, RenderPlan, RendererSettings};
-use gitflux_scene::{Layout, Mainline, RenderConfiguration, ReplayPacingDuration};
+use gitflux_scene::{
+    Layout, Mainline, RenderConfiguration, ReplayPacingDuration, RepositoryGraphScene,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -116,15 +118,11 @@ fn execute_render(config: &RenderCommand) -> Result<RenderExecution, String> {
         ExportProgressEvent::new(ExportProgressPhase::SceneConstruction)
             .with_detail("commit_events", replay.commit_events().len().to_string()),
     );
-    let export_request = VideoExportRequest::try_new(
-        RenderPlan::new(replay, config.render_configuration.clone()),
-        &config.output_path,
-    )
-    .map_err(|error| error.to_string())?;
-    let export_options = VideoExportOptions::new(
-        config.ffmpeg_binary.clone(),
-        FrameCount::new(NonZeroU64::new(1).expect("one frame is non-zero")),
-    );
+    let render_plan = RenderPlan::new(replay, config.render_configuration.clone());
+    let frame_count = render_frame_count(&render_plan);
+    let export_request = VideoExportRequest::try_new(render_plan, &config.output_path)
+        .map_err(|error| error.to_string())?;
+    let export_options = VideoExportOptions::new(config.ffmpeg_binary.clone(), frame_count);
     let manifest_context = config
         .manifest_context(&export_request)?
         .with_progress_events(progress_events.clone());
@@ -147,6 +145,27 @@ fn execute_render(config: &RenderCommand) -> Result<RenderExecution, String> {
 fn execute_preview(config: &PreviewCommand) -> Result<PreviewExecution, String> {
     let mut adapter = NativePreviewWindowAdapter::default();
     execute_preview_with_adapter(config, &mut adapter)
+}
+
+fn render_frame_count(render_plan: &RenderPlan) -> FrameCount {
+    let scene =
+        RepositoryGraphScene::from_replay(render_plan.replay(), render_plan.configuration());
+    let last_activity_frame = scene
+        .activities()
+        .iter()
+        .map(|activity| {
+            activity.playback_frame()
+                + activity
+                    .file_changes()
+                    .iter()
+                    .map(|file_change| file_change.playback_frame_offset())
+                    .max()
+                    .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0);
+
+    FrameCount::new(NonZeroU64::new(last_activity_frame + 1).expect("frame count is non-zero"))
 }
 
 fn execute_preview_with_adapter(
@@ -1119,6 +1138,32 @@ mod tests {
         let fixture = CliGitFixture::new("json");
         let ffmpeg = write_fake_ffmpeg("json");
         let output_path = fixture.path().join("out.mp4");
+        fs::write(fixture.path().join("second.txt"), "second\n")
+            .expect("second fixture file should be written");
+        run_git(fixture.path(), ["add", "second.txt"]);
+        run_git(
+            fixture.path(),
+            ["commit", "--no-gpg-sign", "-m", "Second commit"],
+        );
+        let config_path = write_temp_render_config(
+            "json-render",
+            r##"
+frame_width = 64
+frame_height = 36
+frames_per_second = 2
+
+[theme]
+name = "json-test"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 40
+settle_iterations = 8
+"##,
+        );
         let output = run([
             "render".to_owned(),
             fixture.path().display().to_string(),
@@ -1126,6 +1171,8 @@ mod tests {
             output_path.display().to_string(),
             "--ffmpeg-path".to_owned(),
             ffmpeg.display().to_string(),
+            "--config".to_owned(),
+            config_path.display().to_string(),
             "--json".to_owned(),
         ])
         .expect("JSON render should export");
@@ -1158,6 +1205,13 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| event["timestamp_unix_ms"].as_u64().is_some()));
+        let rendered_frame_count = events
+            .iter()
+            .find(|event| event["phase"].as_str() == Some("frame_rendering"))
+            .and_then(|event| event["details"]["frame_count"].as_str())
+            .and_then(|frame_count| frame_count.parse::<u64>().ok())
+            .expect("frame rendering event should include frame count");
+        assert!(rendered_frame_count > 1);
         assert!(output_path.exists());
         let manifest_path = output_path.with_file_name("out.mp4.gitflux-manifest.json");
         assert!(manifest_path.exists());
