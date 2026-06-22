@@ -8,5 +8,8 @@ name = "gitflux"
 path = "src/main.rs"
 
 [dependencies]
+gitflux-export.workspace = true
+gitflux-ingestion.workspace = true
+gitflux-render.workspace = true
 gitflux-scene.workspace = true
 serde_json = "1"

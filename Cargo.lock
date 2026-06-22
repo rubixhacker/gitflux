@@ -329,6 +329,9 @@ dependencies = [
 name = "gitflux-cli"
 version = "0.1.0"
 dependencies = [
+ "gitflux-export",
+ "gitflux-ingestion",
+ "gitflux-render",
  "gitflux-scene",
  "serde_json",
 ]
