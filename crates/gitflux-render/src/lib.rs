@@ -690,18 +690,21 @@ impl RenderBatches {
         let active_file_ids = active_file_ids(scene, frame_index);
 
         let mut contributors = RenderBatch::new(RenderBatchKind::Contributor);
+        let contributor_size = transform.size_to_clip_space(20.0, 20.0);
         for contributor in scene.contributors() {
             let (x, y) = transform.to_pixels(contributor.position());
-            contributors.push_rect(x, y, 20.0, 20.0, contributor_color);
+            contributors.push_rect(x, y, contributor_size, contributor_color);
         }
 
         let mut directories = RenderBatch::new(RenderBatchKind::Directory);
+        let directory_size = transform.size_to_clip_space(22.0, 14.0);
         for directory in scene.directories() {
             let (x, y) = transform.to_pixels(directory.position());
-            directories.push_rect(x, y, 22.0, 14.0, directory_color);
+            directories.push_rect(x, y, directory_size, directory_color);
         }
 
         let mut files = RenderBatch::new(RenderBatchKind::File);
+        let file_size = transform.size_to_clip_space(14.0, 14.0);
         let mut file_positions = BTreeMap::new();
         for file in scene.files() {
             let (x, y) = transform.to_pixels(file.position());
@@ -713,8 +716,7 @@ impl RenderBatches {
             files.push_rect(
                 x,
                 y,
-                14.0,
-                14.0,
+                file_size,
                 [entity_color[0], entity_color[1], entity_color[2], alpha],
             );
         }
@@ -722,14 +724,20 @@ impl RenderBatches {
         let mut summaries = RenderBatch::new(RenderBatchKind::Summary);
         for summary in scene.visual_summaries() {
             let (x, y) = transform.to_pixels(summary.position());
-            let radius = 16.0 + summary.weight().get().min(8) as f32;
-            summaries.push_rect(x, y, radius, radius, summary_color);
+            let size = 16.0 + summary.weight().get().min(8) as f32;
+            summaries.push_rect(
+                x,
+                y,
+                transform.size_to_clip_space(size, size),
+                summary_color,
+            );
         }
 
         let mut activities = RenderBatch::new(RenderBatchKind::Activity);
+        let activity_size = transform.size_to_clip_space(24.0, 24.0);
         for file_id in active_file_ids {
             if let Some((x, y)) = file_positions.get(&file_id) {
-                activities.push_rect(*x, *y, 24.0, 24.0, activity_color);
+                activities.push_rect(*x, *y, activity_size, activity_color);
             }
         }
 
@@ -762,14 +770,9 @@ impl RenderBatch {
         }
     }
 
-    fn push_rect(
-        &mut self,
-        center_x: f32,
-        center_y: f32,
-        width: f32,
-        height: f32,
-        color: [f32; 4],
-    ) {
+    fn push_rect(&mut self, center_x: f32, center_y: f32, size: ClipSize, color: [f32; 4]) {
+        let width = size.width();
+        let height = size.height();
         let left = center_x - width / 2.0;
         let right = center_x + width / 2.0;
         let top = center_y - height / 2.0;
@@ -782,6 +785,26 @@ impl RenderBatch {
             Vertex::new(right, bottom, color),
             Vertex::new(left, bottom, color),
         ]);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ClipSize {
+    width: f32,
+    height: f32,
+}
+
+impl ClipSize {
+    fn new(width: f32, height: f32) -> Self {
+        Self { width, height }
+    }
+
+    fn width(self) -> f32 {
+        self.width
+    }
+
+    fn height(self) -> f32 {
+        self.height
     }
 }
 
@@ -895,6 +918,10 @@ impl SceneTransform {
             1.0 - (pixel_y / self.height) * 2.0,
         )
     }
+
+    fn size_to_clip_space(self, width: f32, height: f32) -> ClipSize {
+        ClipSize::new((width / self.width) * 2.0, (height / self.height) * 2.0)
+    }
 }
 
 fn create_pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
@@ -1004,7 +1031,7 @@ mod tests {
         RenderConfiguration, RepositoryEntity, RepositoryGraphScene, RepositoryReplay, Theme,
         VisualMetaphor,
     };
-    use std::{num::NonZeroU64, path::PathBuf};
+    use std::{collections::BTreeSet, num::NonZeroU64, path::PathBuf};
 
     #[test]
     fn render_plan_preserves_inputs() {
@@ -1138,18 +1165,26 @@ settle_iterations = 10
         assert_eq!(frame.size(), RenderFrameSize::new(96, 64));
         assert_eq!(frame.frames_per_second(), 12);
         assert_eq!(frame.rgba().len(), 96 * 64 * 4);
-        let background = frame
+        let opaque = frame
             .rgba()
             .chunks_exact(4)
             .filter(|pixel| pixel[3] == 255)
             .count();
-        let non_background = frame
+        let distinct_colors: BTreeSet<[u8; 4]> = frame
             .rgba()
             .chunks_exact(4)
-            .filter(|pixel| pixel[0] > 80 || pixel[1] > 80 || pixel[2] > 80)
-            .count();
-        assert!(background > 0);
-        assert!(non_background > 12);
+            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+            .collect();
+        let all_white = frame
+            .rgba()
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 255, 255, 255]);
+        assert!(opaque > 0);
+        assert!(
+            distinct_colors.len() > 1,
+            "rendered frame should include theme background and visible graph marks"
+        );
+        assert!(!all_white, "rendered frame must not be a solid white field");
     }
 
     #[test]
