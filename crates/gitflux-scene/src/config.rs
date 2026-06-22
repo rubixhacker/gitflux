@@ -15,6 +15,7 @@ pub struct RenderConfiguration {
     replay_pacing: ReplayPacing,
     level_of_detail: LevelOfDetailPolicy,
     explicit_path_filter: ExplicitPathFilter,
+    label_policy: LabelPolicy,
 }
 
 impl RenderConfiguration {
@@ -30,6 +31,7 @@ impl RenderConfiguration {
             replay_pacing: ReplayPacing::default(),
             level_of_detail: LevelOfDetailPolicy::default(),
             explicit_path_filter: ExplicitPathFilter::default(),
+            label_policy: LabelPolicy::default(),
         }
     }
 
@@ -94,23 +96,51 @@ impl RenderConfiguration {
         &self.explicit_path_filter
     }
 
+    /// Returns the policy for typed scene labels.
+    #[must_use]
+    pub fn label_policy(&self) -> LabelPolicy {
+        self.label_policy
+    }
+
     fn try_from_raw(raw: RawRenderConfiguration) -> Result<Self, RenderConfigurationError> {
         let mut errors = RenderConfigurationError::new();
+        let RawRenderConfiguration {
+            frame_width,
+            frame_height,
+            frames_per_second,
+            theme: raw_theme,
+            layout: raw_layout,
+            replay_pacing: raw_replay_pacing,
+            level_of_detail: raw_level_of_detail,
+            filters: raw_filters,
+        } = raw;
+        let RawLayout {
+            kind,
+            entity_spacing,
+            settle_iterations,
+            labels: raw_label_policy,
+        } = raw_layout;
+        let raw_layout = RawLayout {
+            kind,
+            entity_spacing,
+            settle_iterations,
+            labels: None,
+        };
 
-        let frame_size = match FrameSize::new(raw.frame_width, raw.frame_height) {
+        let frame_size = match FrameSize::new(frame_width, frame_height) {
             Ok(frame_size) => Some(frame_size),
             Err(ConfigValueError) => {
-                if raw.frame_width == 0 {
+                if frame_width == 0 {
                     errors.push("frame_width", "positive integer");
                 }
-                if raw.frame_height == 0 {
+                if frame_height == 0 {
                     errors.push("frame_height", "positive integer");
                 }
                 None
             }
         };
 
-        let frames_per_second = match FramesPerSecond::new(raw.frames_per_second) {
+        let frames_per_second = match FramesPerSecond::new(frames_per_second) {
             Ok(frames_per_second) => Some(frames_per_second),
             Err(ConfigValueError) => {
                 errors.push("frames_per_second", "positive integer");
@@ -118,11 +148,13 @@ impl RenderConfiguration {
             }
         };
 
-        let theme = Theme::try_from_raw(raw.theme, &mut errors);
-        let layout = Layout::try_from_raw(raw.layout, &mut errors);
-        let replay_pacing = ReplayPacing::try_from_raw(raw.replay_pacing, &mut errors);
-        let level_of_detail = LevelOfDetailPolicy::try_from_raw(raw.level_of_detail, &mut errors);
-        let explicit_path_filter = ExplicitPathFilter::try_from_raw(raw.filters, &mut errors);
+        let theme = Theme::try_from_raw(raw_theme, &mut errors);
+        let layout = Layout::try_from_raw(raw_layout, &mut errors);
+        let replay_pacing = ReplayPacing::try_from_raw(raw_replay_pacing, &mut errors);
+        let level_of_detail = LevelOfDetailPolicy::try_from_raw(raw_level_of_detail, &mut errors);
+        let explicit_path_filter = ExplicitPathFilter::try_from_raw(raw_filters, &mut errors);
+        let label_policy =
+            LabelPolicy::try_from_raw(raw_label_policy, "layout.labels", &mut errors);
 
         if errors.is_empty() {
             Ok(Self {
@@ -134,6 +166,7 @@ impl RenderConfiguration {
                 replay_pacing: replay_pacing.expect("validated Replay Pacing"),
                 level_of_detail: level_of_detail.expect("validated Level of Detail"),
                 explicit_path_filter: explicit_path_filter.expect("validated explicit filters"),
+                label_policy: label_policy.expect("validated Label Policy"),
             })
         } else {
             Err(errors)
@@ -152,6 +185,7 @@ impl Default for RenderConfiguration {
             replay_pacing: ReplayPacing::default(),
             level_of_detail: LevelOfDetailPolicy::default(),
             explicit_path_filter: ExplicitPathFilter::default(),
+            label_policy: LabelPolicy::default(),
         }
     }
 }
@@ -590,6 +624,191 @@ impl Default for LevelOfDetailPolicy {
     }
 }
 
+/// Label generation rules for render-ready scene data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelPolicy {
+    contributors: bool,
+    entities: bool,
+    summaries: bool,
+    current_commit_subject: bool,
+    replay_date: bool,
+    sparse_entity_limit: EntityCountThreshold,
+    dense_entity_limit: EntityCountThreshold,
+    fade_frames: u32,
+    activity_window_frames: u32,
+}
+
+impl LabelPolicy {
+    /// Returns whether Contributor labels are generated.
+    #[must_use]
+    pub fn contributors(self) -> bool {
+        self.contributors
+    }
+
+    /// Returns whether Repository Entity labels are generated.
+    #[must_use]
+    pub fn entities(self) -> bool {
+        self.entities
+    }
+
+    /// Returns whether Visual Summary labels are generated.
+    #[must_use]
+    pub fn summaries(self) -> bool {
+        self.summaries
+    }
+
+    /// Returns whether current Commit subject overlay labels are generated.
+    #[must_use]
+    pub fn current_commit_subject(self) -> bool {
+        self.current_commit_subject
+    }
+
+    /// Returns whether replay date overlay labels are generated.
+    #[must_use]
+    pub fn replay_date(self) -> bool {
+        self.replay_date
+    }
+
+    /// Returns the entity count limit for sparse label density.
+    #[must_use]
+    pub fn sparse_entity_limit(self) -> EntityCountThreshold {
+        self.sparse_entity_limit
+    }
+
+    /// Returns the entity count limit for balanced label density.
+    #[must_use]
+    pub fn dense_entity_limit(self) -> EntityCountThreshold {
+        self.dense_entity_limit
+    }
+
+    /// Returns overlay fade duration in frames.
+    #[must_use]
+    pub fn fade_frames(self) -> u32 {
+        self.fade_frames
+    }
+
+    /// Returns overlay activity duration in frames.
+    #[must_use]
+    pub fn activity_window_frames(self) -> u32 {
+        self.activity_window_frames
+    }
+
+    pub(crate) fn density_tier(self, entity_count: usize) -> LabelDensityTier {
+        if entity_count <= self.sparse_entity_limit.get() {
+            LabelDensityTier::Sparse
+        } else if entity_count <= self.dense_entity_limit.get() {
+            LabelDensityTier::Balanced
+        } else {
+            LabelDensityTier::Dense
+        }
+    }
+
+    fn try_from_raw(
+        raw: Option<RawLabelPolicy>,
+        field_prefix: &'static str,
+        errors: &mut RenderConfigurationError,
+    ) -> Option<Self> {
+        let Some(raw) = raw else {
+            return Some(Self::default());
+        };
+        let default = Self::default();
+        let sparse_entity_limit = match EntityCountThreshold::new(
+            raw.sparse_entity_limit
+                .unwrap_or_else(|| default.sparse_entity_limit.get()),
+        ) {
+            Ok(threshold) => Some(threshold),
+            Err(ConfigValueError) => {
+                errors.push(
+                    format!("{field_prefix}.sparse_entity_limit"),
+                    "positive integer",
+                );
+                None
+            }
+        };
+        let dense_entity_limit = match EntityCountThreshold::new(
+            raw.dense_entity_limit
+                .unwrap_or_else(|| default.dense_entity_limit.get()),
+        ) {
+            Ok(threshold) => Some(threshold),
+            Err(ConfigValueError) => {
+                errors.push(
+                    format!("{field_prefix}.dense_entity_limit"),
+                    "positive integer",
+                );
+                None
+            }
+        };
+        let fade_frames = raw.fade_frames.unwrap_or(default.fade_frames);
+        let activity_window_frames = raw
+            .activity_window_frames
+            .unwrap_or(default.activity_window_frames);
+
+        if let (Some(sparse), Some(dense)) = (sparse_entity_limit, dense_entity_limit) {
+            if dense.get() < sparse.get() {
+                errors.push(
+                    format!("{field_prefix}.dense_entity_limit"),
+                    format!("integer greater than or equal to {field_prefix}.sparse_entity_limit"),
+                );
+                return None;
+            }
+        }
+        if fade_frames == 0 {
+            errors.push(format!("{field_prefix}.fade_frames"), "positive integer");
+            return None;
+        }
+        if activity_window_frames == 0 {
+            errors.push(
+                format!("{field_prefix}.activity_window_frames"),
+                "positive integer",
+            );
+            return None;
+        }
+
+        Some(Self {
+            contributors: raw.contributors.unwrap_or(default.contributors),
+            entities: raw.entities.unwrap_or(default.entities),
+            summaries: raw.summaries.unwrap_or(default.summaries),
+            current_commit_subject: raw
+                .current_commit_subject
+                .unwrap_or(default.current_commit_subject),
+            replay_date: raw.replay_date.unwrap_or(default.replay_date),
+            sparse_entity_limit: sparse_entity_limit?,
+            dense_entity_limit: dense_entity_limit?,
+            fade_frames,
+            activity_window_frames,
+        })
+    }
+}
+
+impl Default for LabelPolicy {
+    fn default() -> Self {
+        Self {
+            contributors: false,
+            entities: false,
+            summaries: false,
+            current_commit_subject: false,
+            replay_date: false,
+            sparse_entity_limit: EntityCountThreshold::new(4)
+                .expect("default sparse label threshold is valid"),
+            dense_entity_limit: EntityCountThreshold::new(12)
+                .expect("default dense label threshold is valid"),
+            fade_frames: 18,
+            activity_window_frames: 90,
+        }
+    }
+}
+
+/// Scene label density inferred from visible entity count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelDensityTier {
+    /// Few enough entities for direct labels.
+    Sparse,
+    /// Enough entities to prefer structural labels over every item.
+    Balanced,
+    /// Dense enough to rely on summaries and overlays.
+    Dense,
+}
+
 /// Positive Repository Entity count threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntityCountThreshold(usize);
@@ -788,6 +1007,7 @@ struct RawLayout {
     kind: String,
     entity_spacing: u32,
     settle_iterations: u32,
+    labels: Option<RawLabelPolicy>,
 }
 
 struct RawLevelOfDetailPolicy {
@@ -803,6 +1023,18 @@ struct RawReplayPacing {
 
 struct RawExplicitPathFilter {
     included_paths: Vec<String>,
+}
+
+struct RawLabelPolicy {
+    contributors: Option<bool>,
+    entities: Option<bool>,
+    summaries: Option<bool>,
+    current_commit_subject: Option<bool>,
+    replay_date: Option<bool>,
+    sparse_entity_limit: Option<usize>,
+    dense_entity_limit: Option<usize>,
+    fade_frames: Option<u32>,
+    activity_window_frames: Option<u32>,
 }
 
 impl RawRenderConfiguration {
@@ -936,7 +1168,7 @@ impl RawLayout {
         report_unknown_fields(
             table,
             "layout",
-            &["kind", "entity_spacing", "settle_iterations"],
+            &["kind", "entity_spacing", "settle_iterations", "labels"],
             errors,
         );
 
@@ -948,11 +1180,13 @@ impl RawLayout {
             "layout.settle_iterations",
             errors,
         );
+        let labels = RawLabelPolicy::try_from_field(table.get("labels"), "layout.labels", errors);
 
         Some(Self {
             kind: kind?,
             entity_spacing: entity_spacing?,
             settle_iterations: settle_iterations?,
+            labels,
         })
     }
 }
@@ -1062,6 +1296,94 @@ impl RawExplicitPathFilter {
     }
 }
 
+impl RawLabelPolicy {
+    fn try_from_field(
+        value: Option<&Value>,
+        field_prefix: &'static str,
+        errors: &mut RenderConfigurationError,
+    ) -> Option<Self> {
+        let value = value?;
+        let Some(table) = value.as_table() else {
+            errors.push(field_prefix, "table with label policy fields");
+            return None;
+        };
+
+        report_unknown_fields(
+            table,
+            field_prefix,
+            &[
+                "contributors",
+                "entities",
+                "summaries",
+                "current_commit_subject",
+                "replay_date",
+                "sparse_entity_limit",
+                "dense_entity_limit",
+                "fade_frames",
+                "activity_window_frames",
+            ],
+            errors,
+        );
+
+        Some(Self {
+            contributors: optional_bool_field(
+                table,
+                "contributors",
+                format!("{field_prefix}.contributors"),
+                errors,
+            ),
+            entities: optional_bool_field(
+                table,
+                "entities",
+                format!("{field_prefix}.entities"),
+                errors,
+            ),
+            summaries: optional_bool_field(
+                table,
+                "summaries",
+                format!("{field_prefix}.summaries"),
+                errors,
+            ),
+            current_commit_subject: optional_bool_field(
+                table,
+                "current_commit_subject",
+                format!("{field_prefix}.current_commit_subject"),
+                errors,
+            ),
+            replay_date: optional_bool_field(
+                table,
+                "replay_date",
+                format!("{field_prefix}.replay_date"),
+                errors,
+            ),
+            sparse_entity_limit: optional_usize_field(
+                table,
+                "sparse_entity_limit",
+                format!("{field_prefix}.sparse_entity_limit"),
+                errors,
+            ),
+            dense_entity_limit: optional_usize_field(
+                table,
+                "dense_entity_limit",
+                format!("{field_prefix}.dense_entity_limit"),
+                errors,
+            ),
+            fade_frames: optional_u32_field(
+                table,
+                "fade_frames",
+                format!("{field_prefix}.fade_frames"),
+                errors,
+            ),
+            activity_window_frames: optional_u32_field(
+                table,
+                "activity_window_frames",
+                format!("{field_prefix}.activity_window_frames"),
+                errors,
+            ),
+        })
+    }
+}
+
 fn report_unknown_fields(
     table: &toml::map::Map<String, Value>,
     prefix: &str,
@@ -1099,12 +1421,13 @@ fn u32_field(
 fn optional_u32_field(
     table: &toml::map::Map<String, Value>,
     key: &str,
-    field: &'static str,
+    field: impl Into<String>,
     errors: &mut RenderConfigurationError,
 ) -> Option<u32> {
+    let field = field.into();
     match table.get(key) {
         Some(Value::Integer(value)) => u32::try_from(*value).ok().or_else(|| {
-            errors.push(field, "positive integer");
+            errors.push(field.clone(), "positive integer");
             None
         }),
         Some(_) => {
@@ -1118,9 +1441,10 @@ fn optional_u32_field(
 fn optional_bool_field(
     table: &toml::map::Map<String, Value>,
     key: &str,
-    field: &'static str,
+    field: impl Into<String>,
     errors: &mut RenderConfigurationError,
 ) -> Option<bool> {
+    let field = field.into();
     match table.get(key) {
         Some(Value::Boolean(value)) => Some(*value),
         Some(_) => {
@@ -1145,6 +1469,26 @@ fn usize_field(
         errors.push(field, "positive integer");
         None
     })
+}
+
+fn optional_usize_field(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    field: impl Into<String>,
+    errors: &mut RenderConfigurationError,
+) -> Option<usize> {
+    let field = field.into();
+    match table.get(key) {
+        Some(Value::Integer(value)) => usize::try_from(*value).ok().or_else(|| {
+            errors.push(field.clone(), "positive integer");
+            None
+        }),
+        Some(_) => {
+            errors.push(field, "positive integer");
+            None
+        }
+        None => None,
+    }
 }
 
 fn string_field(

@@ -11,9 +11,9 @@ mod scene;
 
 pub use config::{
     ConfigValueError, EntityCountThreshold, EntitySpacing, ExplicitPathFilter, FrameSize,
-    FramesPerSecond, HexColor, Layout, LevelOfDetailPolicy, RenderConfiguration,
-    RenderConfigurationError, ReplayPacing, ReplayPacingDuration, ReplayPacingMode,
-    RepositoryGraphLayout, SettleIterations, Theme, VisualMetaphor,
+    FramesPerSecond, HexColor, LabelDensityTier, LabelPolicy, Layout, LevelOfDetailPolicy,
+    RenderConfiguration, RenderConfigurationError, ReplayPacing, ReplayPacingDuration,
+    ReplayPacingMode, RepositoryGraphLayout, SettleIterations, Theme, VisualMetaphor,
 };
 pub use domain::{
     BranchFlow, CommitEvent, CommitEvidence, CommitId, CommitSubject, CompetingChange,
@@ -22,10 +22,11 @@ pub use domain::{
     MergeSettlement, RepositoryEntity, RepositoryReplay,
 };
 pub use scene::{
-    CommitSceneId, ContributorSceneId, DirectorySceneId, FileSceneId, MotionState,
+    CommitSceneId, ContributorSceneId, DirectorySceneId, FileSceneId, LabelSceneId, MotionState,
     RepositoryGraphScene, SceneActivity, SceneBranchActivity, SceneCompetingChange,
     SceneCompetingChangeEvidence, SceneContributor, SceneDirectory, SceneEmphasis,
-    SceneExplicitPathFilter, SceneFile, SceneFileChange, SceneFrameSize, SceneMergeSettlement,
+    SceneExplicitPathFilter, SceneFile, SceneFileChange, SceneFrameSize, SceneLabel,
+    SceneLabelKind, SceneLabelTarget, SceneLabelTiming, SceneLabelVisibility, SceneMergeSettlement,
     ScenePosition, VisualSummary, VisualSummarySceneId, VisualSummaryWeight,
 };
 
@@ -74,6 +75,8 @@ mod tests {
         assert_eq!(config.theme().name(), "gitflux-dark");
         assert_eq!(config.theme().background_color().as_hex(), "#0b1020");
         assert!(config.layout().is_repository_graph());
+        assert!(!config.label_policy().contributors());
+        assert!(!config.label_policy().current_commit_subject());
     }
 
     #[test]
@@ -202,6 +205,83 @@ settle_iterations = 80
         assert!(config.layout().is_repository_graph());
         assert_eq!(config.layout().entity_spacing().get(), 140);
         assert_eq!(config.layout().settle_iterations().get(), 80);
+    }
+
+    #[test]
+    fn parses_label_policy_toml() {
+        let config = RenderConfiguration::from_toml_str(
+            r##"
+frame_width = 1280
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "terminal"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+
+[layout.labels]
+contributors = true
+entities = true
+summaries = true
+current_commit_subject = true
+replay_date = true
+sparse_entity_limit = 3
+dense_entity_limit = 8
+fade_frames = 12
+activity_window_frames = 48
+"##,
+        )
+        .expect("label policy TOML should parse");
+        let labels = config.label_policy();
+
+        assert!(labels.contributors());
+        assert!(labels.entities());
+        assert!(labels.summaries());
+        assert!(labels.current_commit_subject());
+        assert!(labels.replay_date());
+        assert_eq!(labels.sparse_entity_limit().get(), 3);
+        assert_eq!(labels.dense_entity_limit().get(), 8);
+        assert_eq!(labels.fade_frames(), 12);
+        assert_eq!(labels.activity_window_frames(), 48);
+    }
+
+    #[test]
+    fn label_policy_rejects_inverted_density_thresholds() {
+        let error = RenderConfiguration::from_toml_str(
+            r##"
+frame_width = 1280
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "terminal"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+
+[layout.labels]
+sparse_entity_limit = 9
+dense_entity_limit = 4
+"##,
+        )
+        .expect_err("inverted label density thresholds should report diagnostics");
+
+        let message = error.to_string();
+
+        assert!(message.contains("layout.labels.dense_entity_limit"));
+        assert!(message.contains("greater than or equal"));
     }
 
     #[test]
@@ -2040,6 +2120,344 @@ included_paths = ["src/app"]
         assert_eq!(old_summary.weight().get(), 6);
     }
 
+    #[test]
+    fn scene_labels_include_sparse_entities_and_commit_overlays() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        replay.push_commit_event(commit_event_with_subject_seconds(
+            "a1",
+            "Add library",
+            0,
+            "src/lib.rs",
+        ));
+        replay.push_commit_event(commit_event_with_subject_seconds(
+            "b2",
+            "Write readme",
+            86_400,
+            "README.md",
+        ));
+        let config = render_configuration_with_labels(
+            r#"
+contributors = true
+entities = true
+summaries = true
+current_commit_subject = true
+replay_date = true
+sparse_entity_limit = 3
+dense_entity_limit = 8
+fade_frames = 12
+activity_window_frames = 48
+"#,
+        );
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &config);
+
+        assert_eq!(
+            format!("{:#?}", scene.labels()),
+            r#"[
+    SceneLabel {
+        id: LabelSceneId(
+            "label:contributor:Ada",
+        ),
+        text: "Ada",
+        kind: ContributorName,
+        target: Contributor(
+            ContributorSceneId(
+                "Ada",
+            ),
+        ),
+        visibility: AlwaysVisible,
+        timing: Persistent,
+    },
+    SceneLabel {
+        id: LabelSceneId(
+            "label:directory:src",
+        ),
+        text: "src",
+        kind: DirectoryPath,
+        target: Directory(
+            DirectorySceneId(
+                "src",
+            ),
+        ),
+        visibility: DensityGated {
+            visible_through: Sparse,
+        },
+        timing: Persistent,
+    },
+    SceneLabel {
+        id: LabelSceneId(
+            "label:file:README.md",
+        ),
+        text: "README.md",
+        kind: FilePath,
+        target: File(
+            FileSceneId(
+                "README.md",
+            ),
+        ),
+        visibility: DensityGated {
+            visible_through: Sparse,
+        },
+        timing: Persistent,
+    },
+    SceneLabel {
+        id: LabelSceneId(
+            "label:file:src/lib.rs",
+        ),
+        text: "src/lib.rs",
+        kind: FilePath,
+        target: File(
+            FileSceneId(
+                "src/lib.rs",
+            ),
+        ),
+        visibility: DensityGated {
+            visible_through: Sparse,
+        },
+        timing: Persistent,
+    },
+    SceneLabel {
+        id: LabelSceneId(
+            "label:commit-subject:a1",
+        ),
+        text: "Add library",
+        kind: CurrentCommitSubject,
+        target: Overlay {
+            commit_id: CommitSceneId(
+                "a1",
+            ),
+        },
+        visibility: AlwaysVisible,
+        timing: ActivityFrameWindow {
+            start_frame: 0,
+            end_frame: 48,
+        },
+    },
+    SceneLabel {
+        id: LabelSceneId(
+            "label:replay-date:a1",
+        ),
+        text: "1970-01-01",
+        kind: ReplayDate,
+        target: Overlay {
+            commit_id: CommitSceneId(
+                "a1",
+            ),
+        },
+        visibility: AlwaysVisible,
+        timing: FadeFrameRange {
+            start_frame: 0,
+            end_frame: 12,
+        },
+    },
+    SceneLabel {
+        id: LabelSceneId(
+            "label:commit-subject:b2",
+        ),
+        text: "Write readme",
+        kind: CurrentCommitSubject,
+        target: Overlay {
+            commit_id: CommitSceneId(
+                "b2",
+            ),
+        },
+        visibility: AlwaysVisible,
+        timing: ActivityFrameWindow {
+            start_frame: 60,
+            end_frame: 108,
+        },
+    },
+    SceneLabel {
+        id: LabelSceneId(
+            "label:replay-date:b2",
+        ),
+        text: "1970-01-02",
+        kind: ReplayDate,
+        target: Overlay {
+            commit_id: CommitSceneId(
+                "b2",
+            ),
+        },
+        visibility: AlwaysVisible,
+        timing: FadeFrameRange {
+            start_frame: 60,
+            end_frame: 72,
+        },
+    },
+]"#
+        );
+    }
+
+    #[test]
+    fn scene_labels_use_summary_labels_at_dense_entity_density() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        let dense_changes = (0..5)
+            .map(|index| {
+                FileChange::new(
+                    RepositoryEntity::new(format!("src/generated/file_{index}.rs")),
+                    FileChangeKind::Modified,
+                )
+            })
+            .collect();
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("dense"),
+            Contributor::automation("Generator"),
+            dense_changes,
+        ));
+        let config = render_configuration_with_labels(
+            r#"
+entities = true
+summaries = true
+sparse_entity_limit = 2
+dense_entity_limit = 4
+"#,
+        );
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &config);
+
+        assert_eq!(
+            format!("{:#?}", scene.labels()),
+            r#"[
+    SceneLabel {
+        id: LabelSceneId(
+            "label:summary:src/generated",
+        ),
+        text: "src/generated (5 files)",
+        kind: SummaryPath,
+        target: VisualSummary(
+            VisualSummarySceneId(
+                "summary:src/generated",
+            ),
+        ),
+        visibility: DensityGated {
+            visible_through: Dense,
+        },
+        timing: Persistent,
+    },
+]"#
+        );
+    }
+
+    #[test]
+    fn overlay_labels_cover_large_commit_file_change_spread() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        let file_changes = (0..6)
+            .map(|index| {
+                FileChange::new(
+                    RepositoryEntity::new(format!("src/generated/file_{index}.rs")),
+                    FileChangeKind::Modified,
+                )
+            })
+            .collect();
+        replay.push_commit_event(CommitEvent::from_evidence(
+            CommitEvidence::new(
+                CommitId::new("large"),
+                CommitSubject::new("Regenerate artifacts"),
+                contributor_evidence_at(0),
+                contributor_evidence_at(0),
+                Contributor::automation("Generator"),
+            )
+            .with_file_changes(file_changes),
+        ));
+        let config = RenderConfiguration::from_toml_str(
+            r##"
+frame_width = 1920
+frame_height = 1080
+frames_per_second = 60
+
+[theme]
+name = "gitflux-dark"
+background_color = "#0b1020"
+entity_color = "#7dd3fc"
+contributor_color = "#facc15"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 120
+settle_iterations = 60
+
+[layout.labels]
+current_commit_subject = true
+replay_date = true
+fade_frames = 12
+activity_window_frames = 24
+
+[replay_pacing]
+mode = "adaptive"
+target_duration_seconds = 4
+large_commit_spread_seconds = 2
+"##,
+        )
+        .expect("large commit label configuration should parse");
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &config);
+
+        assert_eq!(
+            format!("{:#?}", scene.labels()),
+            r#"[
+    SceneLabel {
+        id: LabelSceneId(
+            "label:commit-subject:large",
+        ),
+        text: "Regenerate artifacts",
+        kind: CurrentCommitSubject,
+        target: Overlay {
+            commit_id: CommitSceneId(
+                "large",
+            ),
+        },
+        visibility: AlwaysVisible,
+        timing: ActivityFrameWindow {
+            start_frame: 0,
+            end_frame: 120,
+        },
+    },
+    SceneLabel {
+        id: LabelSceneId(
+            "label:replay-date:large",
+        ),
+        text: "1970-01-01",
+        kind: ReplayDate,
+        target: Overlay {
+            commit_id: CommitSceneId(
+                "large",
+            ),
+        },
+        visibility: AlwaysVisible,
+        timing: FadeFrameRange {
+            start_frame: 0,
+            end_frame: 120,
+        },
+    },
+]"#
+        );
+    }
+
+    fn render_configuration_with_labels(labels_toml: &str) -> RenderConfiguration {
+        RenderConfiguration::from_toml_str(&format!(
+            r##"
+frame_width = 1920
+frame_height = 1080
+frames_per_second = 60
+
+[theme]
+name = "gitflux-dark"
+background_color = "#0b1020"
+entity_color = "#7dd3fc"
+contributor_color = "#facc15"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 120
+settle_iterations = 60
+
+[layout.labels]
+{labels_toml}
+"##
+        ))
+        .expect("Label Policy test configuration should parse")
+    }
+
     fn render_configuration_with_replay_pacing(replay_pacing_toml: &str) -> RenderConfiguration {
         RenderConfiguration::from_toml_str(&format!(
             r##"
@@ -2066,10 +2484,19 @@ settle_iterations = 60
     }
 
     fn commit_event_with_seconds(id: &str, seconds: i64, path: &str) -> CommitEvent {
+        commit_event_with_subject_seconds(id, id, seconds, path)
+    }
+
+    fn commit_event_with_subject_seconds(
+        id: &str,
+        subject: &str,
+        seconds: i64,
+        path: &str,
+    ) -> CommitEvent {
         CommitEvent::from_evidence(
             CommitEvidence::new(
                 CommitId::new(id),
-                CommitSubject::new(id),
+                CommitSubject::new(subject),
                 contributor_evidence_at(seconds),
                 contributor_evidence_at(seconds),
                 Contributor::human("Ada"),

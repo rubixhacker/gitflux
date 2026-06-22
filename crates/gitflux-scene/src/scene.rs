@@ -3,12 +3,13 @@ use std::path::Path;
 
 use crate::{
     BranchFlow, CommitEvent, CompetingChange, CompetingChangeConfidence, CompetingChangeSource,
-    ContributorKind, ExplicitPathFilter, FileChange, FileChangeKind, LevelOfDetailPolicy,
-    RenderConfiguration, ReplayPacingDuration, RepositoryEntity, RepositoryReplay,
+    ContributorKind, ExplicitPathFilter, FileChange, FileChangeKind, LabelDensityTier, LabelPolicy,
+    LevelOfDetailPolicy, RenderConfiguration, ReplayPacingDuration, RepositoryEntity,
+    RepositoryReplay,
 };
 
 /// Render-ready scene data for the Repository Graph layout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RepositoryGraphScene {
     mainline: String,
     frame_size: SceneFrameSize,
@@ -20,6 +21,28 @@ pub struct RepositoryGraphScene {
     visual_summaries: Vec<VisualSummary>,
     activities: Vec<SceneActivity>,
     competing_changes: Vec<SceneCompetingChange>,
+    labels: Vec<SceneLabel>,
+}
+
+impl std::fmt::Debug for RepositoryGraphScene {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("RepositoryGraphScene");
+        debug
+            .field("mainline", &self.mainline)
+            .field("frame_size", &self.frame_size)
+            .field("frames_per_second", &self.frames_per_second)
+            .field("explicit_path_filter", &self.explicit_path_filter)
+            .field("contributors", &self.contributors)
+            .field("directories", &self.directories)
+            .field("files", &self.files)
+            .field("visual_summaries", &self.visual_summaries)
+            .field("activities", &self.activities)
+            .field("competing_changes", &self.competing_changes);
+        if !self.labels.is_empty() {
+            debug.field("labels", &self.labels);
+        }
+        debug.finish()
+    }
 }
 
 impl RepositoryGraphScene {
@@ -77,7 +100,7 @@ impl RepositoryGraphScene {
             );
         }
 
-        let contributors = contributor_by_id
+        let contributors: Vec<SceneContributor> = contributor_by_id
             .into_iter()
             .enumerate()
             .map(|(index, (id, seed))| SceneContributor {
@@ -88,7 +111,7 @@ impl RepositoryGraphScene {
             })
             .collect();
 
-        let directories = directory_paths
+        let directories: Vec<SceneDirectory> = directory_paths
             .into_iter()
             .enumerate()
             .map(|(index, path)| SceneDirectory {
@@ -98,7 +121,7 @@ impl RepositoryGraphScene {
             })
             .collect();
 
-        let files = file_paths
+        let files: Vec<SceneFile> = file_paths
             .clone()
             .into_iter()
             .enumerate()
@@ -143,6 +166,15 @@ impl RepositoryGraphScene {
             configuration.frames_per_second().get(),
             configuration.replay_pacing(),
         );
+        let labels = build_scene_labels(
+            &contributors,
+            &directories,
+            &files,
+            &visual_summaries,
+            &paced_activities,
+            &pacing_decisions,
+            configuration.label_policy(),
+        );
         let activities = paced_activities
             .into_iter()
             .enumerate()
@@ -183,6 +215,7 @@ impl RepositoryGraphScene {
             visual_summaries,
             activities,
             competing_changes,
+            labels,
         }
     }
 
@@ -244,6 +277,12 @@ impl RepositoryGraphScene {
     #[must_use]
     pub fn competing_changes(&self) -> &[SceneCompetingChange] {
         &self.competing_changes
+    }
+
+    /// Returns typed labels available to scene renderers.
+    #[must_use]
+    pub fn labels(&self) -> &[SceneLabel] {
+        &self.labels
     }
 }
 
@@ -352,6 +391,132 @@ impl VisualSummaryWeight {
     pub fn get(self) -> usize {
         self.0
     }
+}
+
+/// Render-ready text label data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneLabel {
+    id: LabelSceneId,
+    text: String,
+    kind: SceneLabelKind,
+    target: SceneLabelTarget,
+    visibility: SceneLabelVisibility,
+    timing: SceneLabelTiming,
+}
+
+impl SceneLabel {
+    /// Returns the stable label scene identifier.
+    #[must_use]
+    pub fn id(&self) -> &LabelSceneId {
+        &self.id
+    }
+
+    /// Returns the visible label text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Returns the semantic label kind.
+    #[must_use]
+    pub fn kind(&self) -> SceneLabelKind {
+        self.kind
+    }
+
+    /// Returns the scene element this label describes.
+    #[must_use]
+    pub fn target(&self) -> &SceneLabelTarget {
+        &self.target
+    }
+
+    /// Returns visibility hints for density-aware renderers.
+    #[must_use]
+    pub fn visibility(&self) -> SceneLabelVisibility {
+        self.visibility
+    }
+
+    /// Returns timing hints for playback-aware renderers.
+    #[must_use]
+    pub fn timing(&self) -> SceneLabelTiming {
+        self.timing
+    }
+}
+
+/// A stable scene identifier for a Label.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LabelSceneId(String);
+
+impl LabelSceneId {
+    /// Returns the stable label scene identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Semantic role of a scene label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneLabelKind {
+    /// Contributor display name.
+    ContributorName,
+    /// Directory repository path.
+    DirectoryPath,
+    /// File repository path.
+    FilePath,
+    /// Visual Summary repository path and count.
+    SummaryPath,
+    /// Current Commit subject overlay.
+    CurrentCommitSubject,
+    /// Current replay date overlay.
+    ReplayDate,
+}
+
+/// Scene element described by a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SceneLabelTarget {
+    /// A Contributor node.
+    Contributor(ContributorSceneId),
+    /// A Directory node.
+    Directory(DirectorySceneId),
+    /// A File node.
+    File(FileSceneId),
+    /// A Visual Summary node.
+    VisualSummary(VisualSummarySceneId),
+    /// A frame-space overlay attached to a Commit Event.
+    Overlay { commit_id: CommitSceneId },
+}
+
+/// Visibility rule carried by a scene label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneLabelVisibility {
+    /// Label is not density-gated.
+    AlwaysVisible,
+    /// Label is intended to be shown through the given density tier.
+    DensityGated {
+        /// Highest density tier where the label remains visible.
+        visible_through: LabelDensityTier,
+    },
+}
+
+/// Playback timing rule carried by a scene label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneLabelTiming {
+    /// Label is available for the whole scene.
+    Persistent,
+    /// Label is active while the associated activity is on screen.
+    ActivityFrameWindow {
+        /// Inclusive first playback frame.
+        start_frame: u64,
+        /// Inclusive final playback frame.
+        end_frame: u64,
+    },
+    /// Label is intended to fade across the given frame range.
+    FadeFrameRange {
+        /// Inclusive first playback frame.
+        start_frame: u64,
+        /// Inclusive final playback frame.
+        end_frame: u64,
+    },
 }
 
 /// Output frame dimensions copied into render-ready scene data.
@@ -810,6 +975,10 @@ impl ReplayPacingDecision {
     fn file_change_offsets(&self) -> &[u64] {
         &self.file_change_offsets
     }
+
+    fn max_file_change_offset(&self) -> u64 {
+        self.file_change_offsets.iter().copied().max().unwrap_or(0)
+    }
 }
 
 struct ReplayPacingDecisions;
@@ -1222,4 +1391,135 @@ fn parent_directory_id(path: &Path) -> Option<DirectorySceneId> {
     let parent = path.parent()?;
     (!parent.as_os_str().is_empty())
         .then(|| DirectorySceneId(parent.to_string_lossy().into_owned()))
+}
+
+fn build_scene_labels(
+    contributors: &[SceneContributor],
+    directories: &[SceneDirectory],
+    files: &[SceneFile],
+    visual_summaries: &[VisualSummary],
+    commit_events: &[(&CommitEvent, Vec<SceneFileChange>)],
+    pacing_decisions: &[ReplayPacingDecision],
+    label_policy: LabelPolicy,
+) -> Vec<SceneLabel> {
+    let entity_count = directories.len() + files.len();
+    let density_tier = label_policy.density_tier(entity_count);
+    let mut labels = Vec::new();
+
+    if label_policy.contributors() {
+        labels.extend(contributors.iter().map(|contributor| SceneLabel {
+            id: LabelSceneId(format!("label:contributor:{}", contributor.id.as_str())),
+            text: contributor.display_name.clone(),
+            kind: SceneLabelKind::ContributorName,
+            target: SceneLabelTarget::Contributor(contributor.id.clone()),
+            visibility: SceneLabelVisibility::AlwaysVisible,
+            timing: SceneLabelTiming::Persistent,
+        }));
+    }
+
+    if label_policy.entities() && density_tier == LabelDensityTier::Sparse {
+        labels.extend(directories.iter().map(|directory| SceneLabel {
+            id: LabelSceneId(format!("label:directory:{}", directory.id.as_str())),
+            text: directory.path.clone(),
+            kind: SceneLabelKind::DirectoryPath,
+            target: SceneLabelTarget::Directory(directory.id.clone()),
+            visibility: SceneLabelVisibility::DensityGated {
+                visible_through: LabelDensityTier::Sparse,
+            },
+            timing: SceneLabelTiming::Persistent,
+        }));
+        labels.extend(files.iter().map(|file| SceneLabel {
+            id: LabelSceneId(format!("label:file:{}", file.id.as_str())),
+            text: file.path.clone(),
+            kind: SceneLabelKind::FilePath,
+            target: SceneLabelTarget::File(file.id.clone()),
+            visibility: SceneLabelVisibility::DensityGated {
+                visible_through: LabelDensityTier::Sparse,
+            },
+            timing: SceneLabelTiming::Persistent,
+        }));
+    }
+
+    if label_policy.summaries() && density_tier != LabelDensityTier::Sparse {
+        labels.extend(visual_summaries.iter().map(|summary| SceneLabel {
+            id: LabelSceneId(format!("label:{}", summary.id.as_str())),
+            text: format!(
+                "{} ({} files)",
+                summary.path, summary.represented_entity_count
+            ),
+            kind: SceneLabelKind::SummaryPath,
+            target: SceneLabelTarget::VisualSummary(summary.id.clone()),
+            visibility: SceneLabelVisibility::DensityGated {
+                visible_through: LabelDensityTier::Dense,
+            },
+            timing: SceneLabelTiming::Persistent,
+        }));
+    }
+
+    if label_policy.current_commit_subject() || label_policy.replay_date() {
+        for ((commit_event, _), pacing_decision) in commit_events.iter().zip(pacing_decisions) {
+            let commit_id = CommitSceneId(commit_event.id().as_str().to_owned());
+            let start_frame = pacing_decision.playback_frame();
+            let activity_end_frame = start_frame + pacing_decision.max_file_change_offset();
+            if label_policy.current_commit_subject() && !commit_event.subject().as_str().is_empty()
+            {
+                labels.push(SceneLabel {
+                    id: LabelSceneId(format!("label:commit-subject:{}", commit_id.as_str())),
+                    text: commit_event.subject().as_str().to_owned(),
+                    kind: SceneLabelKind::CurrentCommitSubject,
+                    target: SceneLabelTarget::Overlay {
+                        commit_id: commit_id.clone(),
+                    },
+                    visibility: SceneLabelVisibility::AlwaysVisible,
+                    timing: SceneLabelTiming::ActivityFrameWindow {
+                        start_frame,
+                        end_frame: activity_end_frame
+                            .max(start_frame + u64::from(label_policy.activity_window_frames())),
+                    },
+                });
+            }
+            if label_policy.replay_date() {
+                labels.push(SceneLabel {
+                    id: LabelSceneId(format!("label:replay-date:{}", commit_id.as_str())),
+                    text: replay_date_text(commit_event.committed_at().seconds()),
+                    kind: SceneLabelKind::ReplayDate,
+                    target: SceneLabelTarget::Overlay { commit_id },
+                    visibility: SceneLabelVisibility::AlwaysVisible,
+                    timing: SceneLabelTiming::FadeFrameRange {
+                        start_frame,
+                        end_frame: activity_end_frame
+                            .max(start_frame + u64::from(label_policy.fade_frames())),
+                    },
+                });
+            }
+        }
+    }
+
+    labels
+}
+
+fn replay_date_text(unix_seconds: i64) -> String {
+    let days = unix_seconds.div_euclid(86_400);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i32, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+
+    (
+        i32::try_from(year).expect("civil year fits i32"),
+        u32::try_from(month).expect("civil month fits u32"),
+        u32::try_from(day).expect("civil day fits u32"),
+    )
 }
