@@ -4,12 +4,13 @@
 //! Repository Replay timeline. The current scaffold defines the public request
 //! and summary types without choosing the concrete Git library integration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use git2::{BranchType, Delta, DiffFindOptions, DiffOptions, Oid, Repository, Sort};
 use gitflux_scene::{
-    BranchFlow, CommitEvent, CommitEvidence, CommitId, CommitSubject, Contributor,
+    BranchFlow, CommitEvent, CommitEvidence, CommitId, CommitSubject, CompetingChange,
+    CompetingChangeConfidence, CompetingChangeEvidence, CompetingChangeSource, Contributor,
     ContributorEvidence, ContributorKind, FileChange, FileChangeKind, GitTimestamp, Mainline,
     MergeSettlement, RepositoryEntity, RepositoryReplay,
 };
@@ -321,6 +322,7 @@ pub fn ingest_repository(
             git_repository.commit_event(planned_commit, &mut contributor_normalizer)?,
         );
     }
+    add_file_level_competing_changes(&mut replay);
 
     Ok(RepositoryIngestionSummary::new(replay))
 }
@@ -720,6 +722,46 @@ fn append_merge_settlement(
     }
 }
 
+fn add_file_level_competing_changes(replay: &mut RepositoryReplay) {
+    let mut evidence_by_path: BTreeMap<PathBuf, Vec<CompetingChangeEvidence>> = BTreeMap::new();
+    let mut branches_by_path: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+
+    for event in replay.commit_events() {
+        let BranchFlow::BranchSuperposition { branch, .. } = event.branch_flow() else {
+            continue;
+        };
+
+        for file_change in event.file_changes() {
+            let path = file_change.entity().path().clone();
+            branches_by_path
+                .entry(path.clone())
+                .or_default()
+                .insert(branch.clone());
+            evidence_by_path
+                .entry(path)
+                .or_default()
+                .push(CompetingChangeEvidence::new(
+                    branch.clone(),
+                    event.id().clone(),
+                ));
+        }
+    }
+
+    for (path, branch_names) in branches_by_path {
+        if branch_names.len() < 2 {
+            continue;
+        }
+        if let Some(evidence) = evidence_by_path.remove(&path) {
+            replay.push_competing_change(CompetingChange::new(
+                RepositoryEntity::new(path),
+                CompetingChangeSource::FileLevelOverlap,
+                CompetingChangeConfidence::Medium,
+                evidence,
+            ));
+        }
+    }
+}
+
 struct ContributorNormalizer<'a> {
     rules: &'a ContributorNormalizationRules,
     contributors_by_key: HashMap<String, Contributor>,
@@ -827,7 +869,10 @@ fn file_change_from_delta(
 mod tests {
     use super::{ingest_repository, scaffold_repository_replay, RepositoryIngestionRequest};
     use super::{AutomationContributorRule, ContributorNormalizationRules};
-    use gitflux_scene::{BranchFlow, CommitId, ContributorKind, FileChangeKind, Mainline};
+    use gitflux_scene::{
+        BranchFlow, CommitId, CompetingChangeConfidence, CompetingChangeSource, ContributorKind,
+        FileChangeKind, Mainline,
+    };
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -1014,6 +1059,66 @@ mod tests {
             branch_event.file_changes()[0].entity().path(),
             Path::new("src/search.rs")
         );
+    }
+
+    #[test]
+    fn detects_file_level_competing_change_across_branch_superpositions() {
+        let fixture = GeneratedGitRepository::new();
+        fixture.write_file("README.md", "Gitflux\n");
+        fixture.commit("Add readme", "Ada Lovelace", "ada@example.test");
+        fixture.create_and_checkout_branch("feature/search");
+        fixture.write_file("README.md", "Gitflux\nSearch branch\n");
+        let search_commit = fixture.commit("Add search note", "Grace Hopper", "grace@example.test");
+        fixture.checkout_branch("main");
+        fixture.create_and_checkout_branch("feature/export");
+        fixture.write_file("README.md", "Gitflux\nExport branch\n");
+        let export_commit = fixture.commit("Add export note", "Alan Turing", "alan@example.test");
+        fixture.checkout_branch("main");
+
+        let request = RepositoryIngestionRequest::detect_mainline(fixture.path());
+
+        let summary = ingest_repository(&request).expect("fixture repository should ingest");
+        let competing_changes = summary.replay().competing_changes();
+
+        assert_eq!(competing_changes.len(), 1);
+        let competing_change = &competing_changes[0];
+        assert_eq!(competing_change.entity().path(), Path::new("README.md"));
+        assert_eq!(
+            competing_change.source(),
+            CompetingChangeSource::FileLevelOverlap
+        );
+        assert_eq!(
+            competing_change.confidence(),
+            CompetingChangeConfidence::Medium
+        );
+        assert_eq!(competing_change.evidence().len(), 2);
+        assert!(competing_change.evidence().iter().any(|evidence| {
+            evidence.branch() == "feature/search" && evidence.commit_id().as_str() == search_commit
+        }));
+        assert!(competing_change.evidence().iter().any(|evidence| {
+            evidence.branch() == "feature/export" && evidence.commit_id().as_str() == export_commit
+        }));
+    }
+
+    #[test]
+    fn omits_competing_change_for_non_overlapping_branch_superpositions() {
+        let fixture = GeneratedGitRepository::new();
+        fixture.write_file("README.md", "Gitflux\n");
+        fixture.commit("Add readme", "Ada Lovelace", "ada@example.test");
+        fixture.create_and_checkout_branch("feature/search");
+        fixture.write_file("src/search.rs", "pub fn search() {}\n");
+        fixture.commit("Add search", "Grace Hopper", "grace@example.test");
+        fixture.checkout_branch("main");
+        fixture.create_and_checkout_branch("feature/export");
+        fixture.write_file("src/export.rs", "pub fn export() {}\n");
+        fixture.commit("Add export", "Alan Turing", "alan@example.test");
+        fixture.checkout_branch("main");
+
+        let request = RepositoryIngestionRequest::detect_mainline(fixture.path());
+
+        let summary = ingest_repository(&request).expect("fixture repository should ingest");
+
+        assert!(summary.replay().competing_changes().is_empty());
     }
 
     #[test]
@@ -1473,6 +1578,8 @@ mod tests {
             command
                 .args(&args)
                 .current_dir(self.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_DATE", "2024-01-02T03:04:05Z")
                 .env("GIT_COMMITTER_DATE", "2024-01-02T03:04:05Z");
 
@@ -1504,6 +1611,8 @@ mod tests {
             command
                 .args(args)
                 .current_dir(self.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_DATE", "2024-01-02T03:04:05Z")
                 .env("GIT_COMMITTER_DATE", "2024-01-02T03:04:05Z");
 

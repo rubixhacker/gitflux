@@ -14,6 +14,7 @@ use toml::Value;
 pub struct RepositoryReplay {
     mainline: Mainline,
     commit_events: Vec<CommitEvent>,
+    competing_changes: Vec<CompetingChange>,
 }
 
 impl RepositoryReplay {
@@ -23,6 +24,7 @@ impl RepositoryReplay {
         Self {
             mainline,
             commit_events: Vec::new(),
+            competing_changes: Vec::new(),
         }
     }
 
@@ -38,9 +40,20 @@ impl RepositoryReplay {
         &self.commit_events
     }
 
+    /// Returns provisional Competing Changes detected before Merge Settlement.
+    #[must_use]
+    pub fn competing_changes(&self) -> &[CompetingChange] {
+        &self.competing_changes
+    }
+
     /// Appends a Commit Event to the Repository Replay timeline.
     pub fn push_commit_event(&mut self, commit_event: CommitEvent) {
         self.commit_events.push(commit_event);
+    }
+
+    /// Appends a Competing Change to the Repository Replay.
+    pub fn push_competing_change(&mut self, competing_change: CompetingChange) {
+        self.competing_changes.push(competing_change);
     }
 }
 
@@ -299,6 +312,101 @@ impl MergeSettlement {
     #[must_use]
     pub fn settled_commit_ids(&self) -> &[CommitId] {
         &self.settled_commit_ids
+    }
+}
+
+/// Provisional overlap between branch changes before Merge Settlement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompetingChange {
+    entity: RepositoryEntity,
+    source: CompetingChangeSource,
+    confidence: CompetingChangeConfidence,
+    evidence: Vec<CompetingChangeEvidence>,
+}
+
+impl CompetingChange {
+    /// Creates a Competing Change with typed source and confidence.
+    #[must_use]
+    pub fn new(
+        entity: RepositoryEntity,
+        source: CompetingChangeSource,
+        confidence: CompetingChangeConfidence,
+        evidence: Vec<CompetingChangeEvidence>,
+    ) -> Self {
+        Self {
+            entity,
+            source,
+            confidence,
+            evidence,
+        }
+    }
+
+    /// Returns the Repository Entity with overlapping provisional changes.
+    #[must_use]
+    pub fn entity(&self) -> &RepositoryEntity {
+        &self.entity
+    }
+
+    /// Returns the detection source for this Competing Change.
+    #[must_use]
+    pub fn source(&self) -> CompetingChangeSource {
+        self.source
+    }
+
+    /// Returns the confidence level for this Competing Change.
+    #[must_use]
+    pub fn confidence(&self) -> CompetingChangeConfidence {
+        self.confidence
+    }
+
+    /// Returns the branch and commit evidence behind this Competing Change.
+    #[must_use]
+    pub fn evidence(&self) -> &[CompetingChangeEvidence] {
+        &self.evidence
+    }
+}
+
+/// Evidence source used to detect a Competing Change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompetingChangeSource {
+    /// Repository-relative file path overlap across Branch Superpositions.
+    FileLevelOverlap,
+}
+
+/// Confidence assigned to a Competing Change source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompetingChangeConfidence {
+    /// Medium confidence: overlapping files, without line-range or symbol proof.
+    Medium,
+}
+
+/// Branch Superposition evidence for a Competing Change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompetingChangeEvidence {
+    branch: String,
+    commit_id: CommitId,
+}
+
+impl CompetingChangeEvidence {
+    /// Creates branch and Commit Event evidence for a Competing Change.
+    #[must_use]
+    pub fn new(branch: impl Into<String>, commit_id: CommitId) -> Self {
+        Self {
+            branch: branch.into(),
+            commit_id,
+        }
+    }
+
+    /// Returns the branch carrying provisional work.
+    #[must_use]
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Returns the Commit Event identifier for this evidence.
+    #[must_use]
+    pub fn commit_id(&self) -> &CommitId {
+        &self.commit_id
     }
 }
 
