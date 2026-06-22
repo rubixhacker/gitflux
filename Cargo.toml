@@ -17,3 +17,4 @@ gitflux-export = { path = "crates/gitflux-export" }
 gitflux-ingestion = { path = "crates/gitflux-ingestion" }
 gitflux-render = { path = "crates/gitflux-render" }
 gitflux-scene = { path = "crates/gitflux-scene" }
+git2 = "0.20.2"

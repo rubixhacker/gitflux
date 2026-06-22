@@ -66,8 +66,68 @@ impl Mainline {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitEvent {
     id: CommitId,
+    parent_ids: Vec<CommitId>,
+    subject: CommitSubject,
+    authored_at: GitTimestamp,
+    committed_at: GitTimestamp,
+    author: ContributorEvidence,
+    committer: ContributorEvidence,
     contributor: Contributor,
     file_changes: Vec<FileChange>,
+}
+
+/// Semantic evidence used to build a Commit Event from Repository Ingestion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitEvidence {
+    id: CommitId,
+    parent_ids: Vec<CommitId>,
+    subject: CommitSubject,
+    authored_at: GitTimestamp,
+    committed_at: GitTimestamp,
+    author: ContributorEvidence,
+    committer: ContributorEvidence,
+    contributor: Contributor,
+    file_changes: Vec<FileChange>,
+}
+
+impl CommitEvidence {
+    /// Creates semantic Commit Event evidence.
+    #[must_use]
+    pub fn new(
+        id: CommitId,
+        subject: CommitSubject,
+        author: ContributorEvidence,
+        committer: ContributorEvidence,
+        contributor: Contributor,
+    ) -> Self {
+        let authored_at = author.timestamp();
+        let committed_at = committer.timestamp();
+        Self {
+            id,
+            parent_ids: Vec::new(),
+            subject,
+            authored_at,
+            committed_at,
+            author,
+            committer,
+            contributor,
+            file_changes: Vec::new(),
+        }
+    }
+
+    /// Sets parent Commit Event identifiers.
+    #[must_use]
+    pub fn with_parent_ids(mut self, parent_ids: Vec<CommitId>) -> Self {
+        self.parent_ids = parent_ids;
+        self
+    }
+
+    /// Sets visible File Changes.
+    #[must_use]
+    pub fn with_file_changes(mut self, file_changes: Vec<FileChange>) -> Self {
+        self.file_changes = file_changes;
+        self
+    }
 }
 
 impl CommitEvent {
@@ -76,8 +136,38 @@ impl CommitEvent {
     pub fn new(id: CommitId, contributor: Contributor, file_changes: Vec<FileChange>) -> Self {
         Self {
             id,
+            parent_ids: Vec::new(),
+            subject: CommitSubject::new(""),
+            authored_at: GitTimestamp::new(0, 0),
+            committed_at: GitTimestamp::new(0, 0),
+            author: ContributorEvidence::new(
+                contributor.display_name(),
+                "",
+                GitTimestamp::new(0, 0),
+            ),
+            committer: ContributorEvidence::new(
+                contributor.display_name(),
+                "",
+                GitTimestamp::new(0, 0),
+            ),
             contributor,
             file_changes,
+        }
+    }
+
+    /// Creates a Commit Event from Repository Ingestion evidence.
+    #[must_use]
+    pub fn from_evidence(evidence: CommitEvidence) -> Self {
+        Self {
+            id: evidence.id,
+            parent_ids: evidence.parent_ids,
+            subject: evidence.subject,
+            authored_at: evidence.authored_at,
+            committed_at: evidence.committed_at,
+            author: evidence.author,
+            committer: evidence.committer,
+            contributor: evidence.contributor,
+            file_changes: evidence.file_changes,
         }
     }
 
@@ -85,6 +175,42 @@ impl CommitEvent {
     #[must_use]
     pub fn id(&self) -> &CommitId {
         &self.id
+    }
+
+    /// Returns the parent Commit Event identifiers.
+    #[must_use]
+    pub fn parent_ids(&self) -> &[CommitId] {
+        &self.parent_ids
+    }
+
+    /// Returns the commit subject.
+    #[must_use]
+    pub fn subject(&self) -> &CommitSubject {
+        &self.subject
+    }
+
+    /// Returns the author timestamp.
+    #[must_use]
+    pub fn authored_at(&self) -> GitTimestamp {
+        self.authored_at
+    }
+
+    /// Returns the committer timestamp.
+    #[must_use]
+    pub fn committed_at(&self) -> GitTimestamp {
+        self.committed_at
+    }
+
+    /// Returns raw author evidence.
+    #[must_use]
+    pub fn author(&self) -> &ContributorEvidence {
+        &self.author
+    }
+
+    /// Returns raw committer evidence.
+    #[must_use]
+    pub fn committer(&self) -> &ContributorEvidence {
+        &self.committer
     }
 
     /// Returns the Contributor for this Commit Event.
@@ -97,6 +223,24 @@ impl CommitEvent {
     #[must_use]
     pub fn file_changes(&self) -> &[FileChange] {
         &self.file_changes
+    }
+}
+
+/// A commit subject as recorded by Git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSubject(String);
+
+impl CommitSubject {
+    /// Creates a commit subject.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the subject text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -122,6 +266,7 @@ impl CommitId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChange {
     entity: RepositoryEntity,
+    previous_entity: Option<RepositoryEntity>,
     kind: FileChangeKind,
 }
 
@@ -129,13 +274,33 @@ impl FileChange {
     /// Creates a File Change.
     #[must_use]
     pub fn new(entity: RepositoryEntity, kind: FileChangeKind) -> Self {
-        Self { entity, kind }
+        Self {
+            entity,
+            previous_entity: None,
+            kind,
+        }
+    }
+
+    /// Creates a moved or renamed File Change with source and destination evidence.
+    #[must_use]
+    pub fn moved(from: RepositoryEntity, to: RepositoryEntity) -> Self {
+        Self {
+            entity: to,
+            previous_entity: Some(from),
+            kind: FileChangeKind::Moved,
+        }
     }
 
     /// Returns the Repository Entity affected by the change.
     #[must_use]
     pub fn entity(&self) -> &RepositoryEntity {
         &self.entity
+    }
+
+    /// Returns the previous Repository Entity for moves or renames.
+    #[must_use]
+    pub fn previous_entity(&self) -> Option<&RepositoryEntity> {
+        self.previous_entity.as_ref()
     }
 
     /// Returns the change kind.
@@ -224,6 +389,74 @@ pub enum ContributorKind {
     Human,
     /// A bot, script, dependency service, or other non-human identity.
     Automation,
+}
+
+/// Raw Contributor evidence recorded on a Git commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributorEvidence {
+    name: String,
+    email: String,
+    timestamp: GitTimestamp,
+}
+
+impl ContributorEvidence {
+    /// Creates raw Contributor evidence from Git signature data.
+    #[must_use]
+    pub fn new(name: impl Into<String>, email: impl Into<String>, timestamp: GitTimestamp) -> Self {
+        Self {
+            name: name.into(),
+            email: email.into(),
+            timestamp,
+        }
+    }
+
+    /// Returns the raw Git signature name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the raw Git signature email.
+    #[must_use]
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+
+    /// Returns the Git signature timestamp.
+    #[must_use]
+    pub fn timestamp(&self) -> GitTimestamp {
+        self.timestamp
+    }
+}
+
+/// A Git timestamp with UTC seconds and timezone offset evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GitTimestamp {
+    seconds: i64,
+    offset_minutes: i32,
+}
+
+impl GitTimestamp {
+    /// Creates a Git timestamp.
+    #[must_use]
+    pub fn new(seconds: i64, offset_minutes: i32) -> Self {
+        Self {
+            seconds,
+            offset_minutes,
+        }
+    }
+
+    /// Returns seconds since the Unix epoch.
+    #[must_use]
+    pub fn seconds(self) -> i64 {
+        self.seconds
+    }
+
+    /// Returns the timezone offset in minutes.
+    #[must_use]
+    pub fn offset_minutes(self) -> i32 {
+        self.offset_minutes
+    }
 }
 
 /// A reusable set of parameters for rendering a Repository Replay.
