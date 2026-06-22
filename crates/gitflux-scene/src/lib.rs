@@ -12,7 +12,8 @@ mod scene;
 pub use config::{
     ConfigValueError, EntityCountThreshold, EntitySpacing, ExplicitPathFilter, FrameSize,
     FramesPerSecond, HexColor, Layout, LevelOfDetailPolicy, RenderConfiguration,
-    RenderConfigurationError, RepositoryGraphLayout, SettleIterations, Theme, VisualMetaphor,
+    RenderConfigurationError, ReplayPacing, ReplayPacingDuration, ReplayPacingMode,
+    RepositoryGraphLayout, SettleIterations, Theme, VisualMetaphor,
 };
 pub use domain::{
     BranchFlow, CommitEvent, CommitEvidence, CommitId, CommitSubject, CompetingChange,
@@ -34,7 +35,8 @@ mod tests {
         BranchFlow, CommitEvent, CommitEvidence, CommitId, CommitSubject, CompetingChange,
         CompetingChangeConfidence, CompetingChangeEvidence, CompetingChangeSource, Contributor,
         ContributorEvidence, FileChange, FileChangeKind, GitTimestamp, Mainline, MergeSettlement,
-        RenderConfiguration, RepositoryEntity, RepositoryGraphScene, RepositoryReplay,
+        RenderConfiguration, ReplayPacingDuration, ReplayPacingMode, RepositoryEntity,
+        RepositoryGraphScene, RepositoryReplay,
     };
 
     #[test]
@@ -64,9 +66,110 @@ mod tests {
         assert_eq!(config.frame_size().width(), 1920);
         assert_eq!(config.frame_size().height(), 1080);
         assert_eq!(config.frames_per_second().get(), 60);
+        assert_eq!(config.replay_pacing().mode(), ReplayPacingMode::Adaptive);
+        assert_eq!(
+            config.replay_pacing().duration(),
+            ReplayPacingDuration::Auto
+        );
         assert_eq!(config.theme().name(), "gitflux-dark");
         assert_eq!(config.theme().background_color().as_hex(), "#0b1020");
         assert!(config.layout().is_repository_graph());
+    }
+
+    #[test]
+    fn parses_explicit_replay_pacing_duration_and_auto_defaults() {
+        let explicit = RenderConfiguration::from_toml_str(
+            r##"
+frame_width = 1280
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "terminal"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+
+[replay_pacing]
+mode = "adaptive"
+target_duration_seconds = 45
+large_commit_spread_seconds = 3
+"##,
+        )
+        .expect("explicit Replay Pacing TOML should parse");
+
+        assert_eq!(explicit.replay_pacing().mode(), ReplayPacingMode::Adaptive);
+        assert_eq!(
+            explicit.replay_pacing().duration(),
+            ReplayPacingDuration::Target {
+                duration_seconds: 45
+            }
+        );
+        assert_eq!(explicit.replay_pacing().large_commit_spread_seconds(), 3);
+
+        let auto = RenderConfiguration::from_toml_str(
+            r##"
+frame_width = 1280
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "terminal"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+
+[replay_pacing]
+mode = "adaptive"
+auto_duration = true
+"##,
+        )
+        .expect("auto Replay Pacing TOML should parse");
+
+        assert_eq!(auto.replay_pacing().duration(), ReplayPacingDuration::Auto);
+    }
+
+    #[test]
+    fn replay_pacing_rejects_ambiguous_duration_policy() {
+        let error = RenderConfiguration::from_toml_str(
+            r##"
+frame_width = 1280
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "terminal"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+
+[replay_pacing]
+mode = "adaptive"
+auto_duration = true
+target_duration_seconds = 45
+"##,
+        )
+        .expect_err("ambiguous Replay Pacing duration should report diagnostics");
+
+        let message = error.to_string();
+
+        assert!(message.contains("replay_pacing"));
+        assert!(message.contains("either auto_duration = true or target_duration_seconds"));
     }
 
     #[test]
@@ -243,6 +346,650 @@ frame_height =
     }
 
     #[test]
+    fn adaptive_replay_pacing_compresses_quiet_gaps_and_expands_dense_commits() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        replay.push_commit_event(commit_event_with_seconds("base", 0, "src/base.rs"));
+        replay.push_commit_event(commit_event_with_seconds(
+            "after-quiet",
+            100_000,
+            "src/a.rs",
+        ));
+        replay.push_commit_event(commit_event_with_seconds("dense-1", 100_010, "src/b.rs"));
+        replay.push_commit_event(commit_event_with_seconds("dense-2", 100_020, "src/c.rs"));
+        let config = render_configuration_with_replay_pacing(
+            r#"
+mode = "adaptive"
+target_duration_seconds = 10
+"#,
+        );
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &config);
+
+        assert_eq!(
+            format!("{scene:#?}"),
+            r#"RepositoryGraphScene {
+    mainline: "main",
+    frame_size: SceneFrameSize {
+        width: 1920,
+        height: 1080,
+    },
+    frames_per_second: 60,
+    explicit_path_filter: None,
+    contributors: [
+        SceneContributor {
+            id: ContributorSceneId(
+                "Ada",
+            ),
+            display_name: "Ada",
+            kind: Human,
+            position: ScenePosition {
+                x: 0,
+                y: 0,
+            },
+        },
+    ],
+    directories: [
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src",
+            ),
+            path: "src",
+            position: ScenePosition {
+                x: 0,
+                y: 120,
+            },
+        },
+    ],
+    files: [
+        SceneFile {
+            id: FileSceneId(
+                "src/a.rs",
+            ),
+            path: "src/a.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src",
+                ),
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/b.rs",
+            ),
+            path: "src/b.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src",
+                ),
+            ),
+            position: ScenePosition {
+                x: 120,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/base.rs",
+            ),
+            path: "src/base.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src",
+                ),
+            ),
+            position: ScenePosition {
+                x: 240,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/c.rs",
+            ),
+            path: "src/c.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src",
+                ),
+            ),
+            position: ScenePosition {
+                x: 360,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+    ],
+    visual_summaries: [],
+    activities: [
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "base",
+            ),
+            playback_frame: 0,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/base.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "after-quiet",
+            ),
+            playback_frame: 424,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/a.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "dense-1",
+            ),
+            playback_frame: 512,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/b.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "dense-2",
+            ),
+            playback_frame: 600,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/c.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+    ],
+    competing_changes: [],
+}"#
+        );
+    }
+
+    #[test]
+    fn replay_pacing_orders_parent_before_child_when_replay_order_is_messy() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        replay.push_commit_event(CommitEvent::from_evidence(
+            CommitEvidence::new(
+                CommitId::new("child"),
+                CommitSubject::new("child"),
+                contributor_evidence_at(100),
+                contributor_evidence_at(100),
+                Contributor::human("Ada"),
+            )
+            .with_parent_ids(vec![CommitId::new("parent")])
+            .with_file_changes(vec![FileChange::new(
+                RepositoryEntity::new("src/child.rs"),
+                FileChangeKind::Added,
+            )]),
+        ));
+        replay.push_commit_event(commit_event_with_seconds("parent", 1_000, "src/parent.rs"));
+        let config = render_configuration_with_replay_pacing(
+            r#"
+mode = "adaptive"
+target_duration_seconds = 2
+"#,
+        );
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &config);
+
+        assert_eq!(
+            format!("{scene:#?}"),
+            r#"RepositoryGraphScene {
+    mainline: "main",
+    frame_size: SceneFrameSize {
+        width: 1920,
+        height: 1080,
+    },
+    frames_per_second: 60,
+    explicit_path_filter: None,
+    contributors: [
+        SceneContributor {
+            id: ContributorSceneId(
+                "Ada",
+            ),
+            display_name: "Ada",
+            kind: Human,
+            position: ScenePosition {
+                x: 0,
+                y: 0,
+            },
+        },
+    ],
+    directories: [
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src",
+            ),
+            path: "src",
+            position: ScenePosition {
+                x: 0,
+                y: 120,
+            },
+        },
+    ],
+    files: [
+        SceneFile {
+            id: FileSceneId(
+                "src/child.rs",
+            ),
+            path: "src/child.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src",
+                ),
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/parent.rs",
+            ),
+            path: "src/parent.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src",
+                ),
+            ),
+            position: ScenePosition {
+                x: 120,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+    ],
+    visual_summaries: [],
+    activities: [
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "parent",
+            ),
+            playback_frame: 0,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/parent.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "child",
+            ),
+            playback_frame: 120,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/child.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+    ],
+    competing_changes: [],
+}"#
+        );
+    }
+
+    #[test]
+    fn large_commit_file_changes_spread_inside_bounded_replay_pacing_window() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        let file_changes = (0..6)
+            .map(|index| {
+                FileChange::new(
+                    RepositoryEntity::new(format!("src/generated/file_{index}.rs")),
+                    FileChangeKind::Added,
+                )
+            })
+            .collect();
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("huge"),
+            Contributor::automation("Generator"),
+            file_changes,
+        ));
+        let config = render_configuration_with_replay_pacing(
+            r#"
+mode = "adaptive"
+target_duration_seconds = 1
+large_commit_spread_seconds = 2
+"#,
+        );
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &config);
+
+        assert_eq!(
+            format!("{scene:#?}"),
+            r#"RepositoryGraphScene {
+    mainline: "main",
+    frame_size: SceneFrameSize {
+        width: 1920,
+        height: 1080,
+    },
+    frames_per_second: 60,
+    explicit_path_filter: None,
+    contributors: [
+        SceneContributor {
+            id: ContributorSceneId(
+                "Generator",
+            ),
+            display_name: "Generator",
+            kind: Automation,
+            position: ScenePosition {
+                x: 0,
+                y: 0,
+            },
+        },
+    ],
+    directories: [
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src",
+            ),
+            path: "src",
+            position: ScenePosition {
+                x: 0,
+                y: 120,
+            },
+        },
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src/generated",
+            ),
+            path: "src/generated",
+            position: ScenePosition {
+                x: 120,
+                y: 120,
+            },
+        },
+    ],
+    files: [
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_0.rs",
+            ),
+            path: "src/generated/file_0.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_1.rs",
+            ),
+            path: "src/generated/file_1.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 120,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_2.rs",
+            ),
+            path: "src/generated/file_2.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 240,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_3.rs",
+            ),
+            path: "src/generated/file_3.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 360,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_4.rs",
+            ),
+            path: "src/generated/file_4.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 480,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_5.rs",
+            ),
+            path: "src/generated/file_5.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 600,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+    ],
+    visual_summaries: [
+        VisualSummary {
+            id: VisualSummarySceneId(
+                "summary:src/generated",
+            ),
+            path: "src/generated",
+            represented_file_ids: [
+                FileSceneId(
+                    "src/generated/file_0.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_1.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_2.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_3.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_4.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_5.rs",
+                ),
+            ],
+            represented_entity_count: 6,
+            activity_count: 6,
+            weight: VisualSummaryWeight(
+                6,
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 360,
+            },
+            emphasis: DeEmphasized,
+        },
+    ],
+    activities: [
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "huge",
+            ),
+            playback_frame: 0,
+            contributor_id: ContributorSceneId(
+                "Generator",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_0.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_1.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                    playback_frame_offset: 12,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_2.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                    playback_frame_offset: 24,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_3.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                    playback_frame_offset: 35,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_4.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                    playback_frame_offset: 47,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_5.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                    playback_frame_offset: 59,
+                },
+            ],
+        },
+    ],
+    competing_changes: [],
+}"#
+        );
+    }
+
+    #[test]
     fn repository_graph_scene_snapshots_linear_replay() {
         let mut replay = RepositoryReplay::new(Mainline::new("main"));
 
@@ -400,6 +1147,50 @@ frame_height =
     competing_changes: [],
 }"#
         );
+    }
+
+    #[test]
+    fn large_commit_file_changes_do_not_overlap_next_activity_frame() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        let file_changes = (0..6)
+            .map(|index| {
+                FileChange::new(
+                    RepositoryEntity::new(format!("src/generated/file_{index}.rs")),
+                    FileChangeKind::Added,
+                )
+            })
+            .collect();
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("huge"),
+            Contributor::automation("Generator"),
+            file_changes,
+        ));
+        replay.push_commit_event(commit_event_with_seconds("next", 1, "src/next.rs"));
+        let config = render_configuration_with_replay_pacing(
+            r#"
+mode = "adaptive"
+target_duration_seconds = 1
+large_commit_spread_seconds = 3
+"#,
+        );
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &config);
+        let huge_activity = &scene.activities()[0];
+        let next_activity = &scene.activities()[1];
+        let available_frames = next_activity.playback_frame() - huge_activity.playback_frame();
+
+        assert_eq!(
+            huge_activity
+                .file_changes()
+                .iter()
+                .map(|file_change| file_change.playback_frame_offset())
+                .collect::<Vec<_>>(),
+            vec![0, 12, 24, 35, 47, 59]
+        );
+        assert!(huge_activity
+            .file_changes()
+            .iter()
+            .all(|file_change| file_change.playback_frame_offset() < available_frames));
     }
 
     #[test]
@@ -1247,5 +2038,50 @@ included_paths = ["src/app"]
         assert_eq!(old_summary.represented_entity_count(), 5);
         assert_eq!(old_summary.activity_count(), 6);
         assert_eq!(old_summary.weight().get(), 6);
+    }
+
+    fn render_configuration_with_replay_pacing(replay_pacing_toml: &str) -> RenderConfiguration {
+        RenderConfiguration::from_toml_str(&format!(
+            r##"
+frame_width = 1920
+frame_height = 1080
+frames_per_second = 60
+
+[theme]
+name = "gitflux-dark"
+background_color = "#0b1020"
+entity_color = "#7dd3fc"
+contributor_color = "#facc15"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 120
+settle_iterations = 60
+
+[replay_pacing]
+{replay_pacing_toml}
+"##
+        ))
+        .expect("Replay Pacing test configuration should parse")
+    }
+
+    fn commit_event_with_seconds(id: &str, seconds: i64, path: &str) -> CommitEvent {
+        CommitEvent::from_evidence(
+            CommitEvidence::new(
+                CommitId::new(id),
+                CommitSubject::new(id),
+                contributor_evidence_at(seconds),
+                contributor_evidence_at(seconds),
+                Contributor::human("Ada"),
+            )
+            .with_file_changes(vec![FileChange::new(
+                RepositoryEntity::new(path),
+                FileChangeKind::Added,
+            )]),
+        )
+    }
+
+    fn contributor_evidence_at(seconds: i64) -> ContributorEvidence {
+        ContributorEvidence::new("Ada", "ada@example.com", GitTimestamp::new(seconds, 0))
     }
 }

@@ -12,6 +12,7 @@ pub struct RenderConfiguration {
     frames_per_second: FramesPerSecond,
     theme: Theme,
     layout: Layout,
+    replay_pacing: ReplayPacing,
     level_of_detail: LevelOfDetailPolicy,
     explicit_path_filter: ExplicitPathFilter,
 }
@@ -26,6 +27,7 @@ impl RenderConfiguration {
             frames_per_second: FramesPerSecond::new(60).expect("default FPS is valid"),
             theme,
             layout,
+            replay_pacing: ReplayPacing::default(),
             level_of_detail: LevelOfDetailPolicy::default(),
             explicit_path_filter: ExplicitPathFilter::default(),
         }
@@ -74,6 +76,12 @@ impl RenderConfiguration {
         &self.layout
     }
 
+    /// Returns the Replay Pacing configuration.
+    #[must_use]
+    pub fn replay_pacing(&self) -> ReplayPacing {
+        self.replay_pacing
+    }
+
     /// Returns the Level of Detail policy for scene summarization.
     #[must_use]
     pub fn level_of_detail(&self) -> LevelOfDetailPolicy {
@@ -112,6 +120,7 @@ impl RenderConfiguration {
 
         let theme = Theme::try_from_raw(raw.theme, &mut errors);
         let layout = Layout::try_from_raw(raw.layout, &mut errors);
+        let replay_pacing = ReplayPacing::try_from_raw(raw.replay_pacing, &mut errors);
         let level_of_detail = LevelOfDetailPolicy::try_from_raw(raw.level_of_detail, &mut errors);
         let explicit_path_filter = ExplicitPathFilter::try_from_raw(raw.filters, &mut errors);
 
@@ -122,6 +131,7 @@ impl RenderConfiguration {
                 frames_per_second: frames_per_second.expect("validated FPS"),
                 theme: theme.expect("validated Theme"),
                 layout: layout.expect("validated Layout"),
+                replay_pacing: replay_pacing.expect("validated Replay Pacing"),
                 level_of_detail: level_of_detail.expect("validated Level of Detail"),
                 explicit_path_filter: explicit_path_filter.expect("validated explicit filters"),
             })
@@ -139,6 +149,7 @@ impl Default for RenderConfiguration {
             frames_per_second: FramesPerSecond::new(60).expect("default FPS is valid"),
             theme: Theme::default(),
             layout: Layout::RepositoryGraphWithParameters(RepositoryGraphLayout::default()),
+            replay_pacing: ReplayPacing::default(),
             level_of_detail: LevelOfDetailPolicy::default(),
             explicit_path_filter: ExplicitPathFilter::default(),
         }
@@ -419,6 +430,119 @@ impl Default for RepositoryGraphLayout {
     }
 }
 
+/// Replay Pacing maps repository history time into playback time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayPacing {
+    mode: ReplayPacingMode,
+    duration: ReplayPacingDuration,
+    large_commit_spread_seconds: u32,
+}
+
+impl ReplayPacing {
+    /// Returns the Replay Pacing mode.
+    #[must_use]
+    pub fn mode(self) -> ReplayPacingMode {
+        self.mode
+    }
+
+    /// Returns the Replay Pacing duration policy.
+    #[must_use]
+    pub fn duration(self) -> ReplayPacingDuration {
+        self.duration
+    }
+
+    /// Returns the bounded intra-commit spread window in seconds.
+    #[must_use]
+    pub fn large_commit_spread_seconds(self) -> u32 {
+        self.large_commit_spread_seconds
+    }
+
+    fn try_from_raw(
+        raw: Option<RawReplayPacing>,
+        errors: &mut RenderConfigurationError,
+    ) -> Option<Self> {
+        let Some(raw) = raw else {
+            return Some(Self::default());
+        };
+
+        let mode = match raw.mode.as_str() {
+            "adaptive" => Some(ReplayPacingMode::Adaptive),
+            _ => {
+                errors.push("replay_pacing.mode", r#""adaptive""#);
+                None
+            }
+        };
+        let duration = if raw.auto_duration.unwrap_or(false) {
+            if raw.target_duration_seconds.is_some() {
+                errors.push(
+                    "replay_pacing",
+                    "either auto_duration = true or target_duration_seconds, not both",
+                );
+                None
+            } else {
+                Some(ReplayPacingDuration::Auto)
+            }
+        } else {
+            match raw.target_duration_seconds {
+                Some(0) | None => {
+                    errors.push(
+                        "replay_pacing.target_duration_seconds",
+                        "positive integer or auto_duration = true",
+                    );
+                    None
+                }
+                Some(duration_seconds) => Some(ReplayPacingDuration::Target { duration_seconds }),
+            }
+        };
+        let large_commit_spread_seconds = match raw.large_commit_spread_seconds {
+            Some(0) => {
+                errors.push(
+                    "replay_pacing.large_commit_spread_seconds",
+                    "positive integer",
+                );
+                None
+            }
+            Some(value) => Some(value),
+            None => Some(Self::default().large_commit_spread_seconds),
+        };
+
+        Some(Self {
+            mode: mode?,
+            duration: duration?,
+            large_commit_spread_seconds: large_commit_spread_seconds?,
+        })
+    }
+}
+
+impl Default for ReplayPacing {
+    fn default() -> Self {
+        Self {
+            mode: ReplayPacingMode::Adaptive,
+            duration: ReplayPacingDuration::Auto,
+            large_commit_spread_seconds: 2,
+        }
+    }
+}
+
+/// Replay Pacing strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayPacingMode {
+    /// Adaptively compress quiet gaps and spread dense Commit Events.
+    Adaptive,
+}
+
+/// Replay Pacing duration policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayPacingDuration {
+    /// Derive a deterministic duration from visible Commit Event count.
+    Auto,
+    /// Fit visible history into an explicit target duration.
+    Target {
+        /// Target playback duration in seconds.
+        duration_seconds: u32,
+    },
+}
+
 /// A render policy that summarizes dense Repository Entities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LevelOfDetailPolicy {
@@ -648,6 +772,7 @@ struct RawRenderConfiguration {
     frames_per_second: u32,
     theme: RawTheme,
     layout: RawLayout,
+    replay_pacing: Option<RawReplayPacing>,
     level_of_detail: Option<RawLevelOfDetailPolicy>,
     filters: Option<RawExplicitPathFilter>,
 }
@@ -667,6 +792,13 @@ struct RawLayout {
 
 struct RawLevelOfDetailPolicy {
     dense_directory_threshold: usize,
+}
+
+struct RawReplayPacing {
+    mode: String,
+    target_duration_seconds: Option<u32>,
+    auto_duration: Option<bool>,
+    large_commit_spread_seconds: Option<u32>,
 }
 
 struct RawExplicitPathFilter {
@@ -693,6 +825,7 @@ impl RawRenderConfiguration {
                 "frames_per_second",
                 "theme",
                 "layout",
+                "replay_pacing",
                 "level_of_detail",
                 "filters",
             ],
@@ -705,6 +838,8 @@ impl RawRenderConfiguration {
             u32_field(table, "frames_per_second", "frames_per_second", &mut errors);
         let theme = RawTheme::try_from_field(table.get("theme"), &mut errors);
         let layout = RawLayout::try_from_field(table.get("layout"), &mut errors);
+        let replay_pacing =
+            RawReplayPacing::try_from_field(table.get("replay_pacing"), &mut errors);
         let level_of_detail =
             RawLevelOfDetailPolicy::try_from_field(table.get("level_of_detail"), &mut errors);
         let filters = RawExplicitPathFilter::try_from_field(table.get("filters"), &mut errors);
@@ -716,6 +851,7 @@ impl RawRenderConfiguration {
                 frames_per_second: frames_per_second.expect("validated FPS"),
                 theme: theme.expect("validated Theme section"),
                 layout: layout.expect("validated Layout section"),
+                replay_pacing,
                 level_of_detail,
                 filters,
             })
@@ -852,6 +988,58 @@ impl RawLevelOfDetailPolicy {
     }
 }
 
+impl RawReplayPacing {
+    fn try_from_field(
+        value: Option<&Value>,
+        errors: &mut RenderConfigurationError,
+    ) -> Option<Self> {
+        let value = value?;
+        let Some(table) = value.as_table() else {
+            errors.push("replay_pacing", "table with Replay Pacing fields");
+            return None;
+        };
+
+        report_unknown_fields(
+            table,
+            "replay_pacing",
+            &[
+                "mode",
+                "target_duration_seconds",
+                "auto_duration",
+                "large_commit_spread_seconds",
+            ],
+            errors,
+        );
+
+        let mode = string_field(table, "mode", "replay_pacing.mode", r#""adaptive""#, errors);
+        let target_duration_seconds = optional_u32_field(
+            table,
+            "target_duration_seconds",
+            "replay_pacing.target_duration_seconds",
+            errors,
+        );
+        let auto_duration = optional_bool_field(
+            table,
+            "auto_duration",
+            "replay_pacing.auto_duration",
+            errors,
+        );
+        let large_commit_spread_seconds = optional_u32_field(
+            table,
+            "large_commit_spread_seconds",
+            "replay_pacing.large_commit_spread_seconds",
+            errors,
+        );
+
+        Some(Self {
+            mode: mode?,
+            target_duration_seconds,
+            auto_duration,
+            large_commit_spread_seconds,
+        })
+    }
+}
+
 impl RawExplicitPathFilter {
     fn try_from_field(
         value: Option<&Value>,
@@ -906,6 +1094,41 @@ fn u32_field(
         errors.push(field, "positive integer");
         None
     })
+}
+
+fn optional_u32_field(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    field: &'static str,
+    errors: &mut RenderConfigurationError,
+) -> Option<u32> {
+    match table.get(key) {
+        Some(Value::Integer(value)) => u32::try_from(*value).ok().or_else(|| {
+            errors.push(field, "positive integer");
+            None
+        }),
+        Some(_) => {
+            errors.push(field, "positive integer");
+            None
+        }
+        None => None,
+    }
+}
+
+fn optional_bool_field(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    field: &'static str,
+    errors: &mut RenderConfigurationError,
+) -> Option<bool> {
+    match table.get(key) {
+        Some(Value::Boolean(value)) => Some(*value),
+        Some(_) => {
+            errors.push(field, "boolean");
+            None
+        }
+        None => None,
+    }
 }
 
 fn usize_field(

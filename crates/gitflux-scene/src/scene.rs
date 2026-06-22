@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::{
     BranchFlow, CommitEvent, CompetingChange, CompetingChangeConfidence, CompetingChangeSource,
     ContributorKind, ExplicitPathFilter, FileChange, FileChangeKind, LevelOfDetailPolicy,
-    RenderConfiguration, RepositoryEntity, RepositoryReplay,
+    RenderConfiguration, ReplayPacingDuration, RepositoryEntity, RepositoryReplay,
 };
 
 /// Render-ready scene data for the Repository Graph layout.
@@ -119,7 +119,7 @@ impl RepositoryGraphScene {
             spacing,
         );
 
-        let activities = replay
+        let visible_activities: Vec<(&CommitEvent, Vec<SceneFileChange>)> = replay
             .commit_events()
             .iter()
             .filter_map(|commit_event| {
@@ -136,13 +136,24 @@ impl RepositoryGraphScene {
                     .collect();
                 (!file_changes.is_empty()).then_some((commit_event, file_changes))
             })
+            .collect();
+        let paced_activities = order_commit_events_by_parent_ids(visible_activities);
+        let pacing_decisions = ReplayPacingDecisions::from_commit_events(
+            &paced_activities,
+            configuration.frames_per_second().get(),
+            configuration.replay_pacing(),
+        );
+        let activities = paced_activities
+            .into_iter()
             .enumerate()
-            .map(|(index, (commit_event, file_changes))| {
-                let playback_frame = u64::from(configuration.frames_per_second().get())
-                    * u64::try_from(index).expect("commit index fits playback frame");
+            .map(|(index, (commit_event, mut file_changes))| {
+                let pacing_decision = pacing_decisions
+                    .get(index)
+                    .expect("Replay Pacing decision exists for visible Commit Event");
+                apply_file_change_offsets(&mut file_changes, pacing_decision.file_change_offsets());
                 SceneActivity {
                     commit_id: CommitSceneId(commit_event.id().as_str().to_owned()),
-                    playback_frame,
+                    playback_frame: pacing_decision.playback_frame(),
                     contributor_id: ContributorSceneId(
                         commit_event.contributor().identity_key().to_owned(),
                     ),
@@ -709,12 +720,28 @@ impl From<&BranchFlow> for SceneBranchActivity {
 }
 
 /// Render-ready File Change activity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SceneFileChange {
     file_id: FileSceneId,
     previous_file_id: Option<FileSceneId>,
     kind: FileChangeKind,
     motion: MotionState,
+    playback_frame_offset: u64,
+}
+
+impl std::fmt::Debug for SceneFileChange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("SceneFileChange");
+        debug
+            .field("file_id", &self.file_id)
+            .field("previous_file_id", &self.previous_file_id)
+            .field("kind", &self.kind)
+            .field("motion", &self.motion);
+        if self.playback_frame_offset != 0 {
+            debug.field("playback_frame_offset", &self.playback_frame_offset);
+        }
+        debug.finish()
+    }
 }
 
 impl SceneFileChange {
@@ -741,6 +768,12 @@ impl SceneFileChange {
     pub fn motion(&self) -> MotionState {
         self.motion
     }
+
+    /// Returns this File Change's offset from its Commit Event activity frame.
+    #[must_use]
+    pub fn playback_frame_offset(&self) -> u64 {
+        self.playback_frame_offset
+    }
 }
 
 impl From<&FileChange> for SceneFileChange {
@@ -758,8 +791,266 @@ impl SceneFileChange {
                 .map(|entity| FileSceneId(repository_entity_path(entity))),
             kind: *file_change.kind(),
             motion,
+            playback_frame_offset: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayPacingDecision {
+    playback_frame: u64,
+    file_change_offsets: Vec<u64>,
+}
+
+impl ReplayPacingDecision {
+    fn playback_frame(&self) -> u64 {
+        self.playback_frame
+    }
+
+    fn file_change_offsets(&self) -> &[u64] {
+        &self.file_change_offsets
+    }
+}
+
+struct ReplayPacingDecisions;
+
+impl ReplayPacingDecisions {
+    fn from_commit_events(
+        commit_events: &[(&CommitEvent, Vec<SceneFileChange>)],
+        frames_per_second: u32,
+        replay_pacing: crate::ReplayPacing,
+    ) -> Vec<ReplayPacingDecision> {
+        let timeline = ReplayTimeline::from_commit_events(
+            commit_events,
+            frames_per_second,
+            replay_pacing.duration(),
+        );
+        let playback_frames = timeline.playback_frames();
+        let large_commit_window_frames =
+            u64::from(frames_per_second) * u64::from(replay_pacing.large_commit_spread_seconds());
+
+        playback_frames
+            .iter()
+            .enumerate()
+            .zip(commit_events)
+            .map(
+                |((index, playback_frame), (_, file_changes))| ReplayPacingDecision {
+                    playback_frame: *playback_frame,
+                    file_change_offsets: file_change_offsets(file_changes.len(), {
+                        let available_window_frames = timeline.available_spread_frames_after(index);
+                        large_commit_window_frames.min(available_window_frames)
+                    }),
+                },
+            )
+            .collect()
+    }
+}
+
+struct ReplayTimeline {
+    playback_frames: Vec<u64>,
+    target_end_frame: Option<u64>,
+}
+
+impl ReplayTimeline {
+    fn from_commit_events(
+        commit_events: &[(&CommitEvent, Vec<SceneFileChange>)],
+        frames_per_second: u32,
+        duration: ReplayPacingDuration,
+    ) -> Self {
+        let playback_frames = paced_playback_frames(commit_events, frames_per_second, duration);
+        let target_end_frame = explicit_target_end_frame(duration, frames_per_second);
+
+        Self {
+            playback_frames,
+            target_end_frame,
+        }
+    }
+
+    fn playback_frames(&self) -> &[u64] {
+        &self.playback_frames
+    }
+
+    fn available_spread_frames_after(&self, index: usize) -> u64 {
+        let playback_frame = self
+            .playback_frames
+            .get(index)
+            .copied()
+            .expect("Replay Timeline has frame for Commit Event index");
+        if let Some(next_playback_frame) = self.playback_frames.get(index + 1) {
+            return exclusive_spread_window(playback_frame, *next_playback_frame);
+        }
+
+        self.target_end_frame
+            .map(|target_end_frame| exclusive_spread_window(playback_frame, target_end_frame))
+            .unwrap_or(u64::MAX)
+    }
+}
+
+fn exclusive_spread_window(playback_frame: u64, boundary_frame: u64) -> u64 {
+    boundary_frame
+        .saturating_sub(playback_frame)
+        .saturating_sub(1)
+}
+
+fn paced_playback_frames(
+    commit_events: &[(&CommitEvent, Vec<SceneFileChange>)],
+    frames_per_second: u32,
+    duration: ReplayPacingDuration,
+) -> Vec<u64> {
+    match commit_events.len() {
+        0 => return Vec::new(),
+        1 => return vec![0],
+        _ => {}
+    }
+
+    let interval_count = commit_events.len() - 1;
+    let target_frames = target_frames(duration, frames_per_second, interval_count);
+    let weights: Vec<f64> = commit_events
+        .windows(2)
+        .map(|pair| {
+            let previous = pair[0].0.committed_at().seconds();
+            let current = pair[1].0.committed_at().seconds();
+            let quiet_gap_seconds = current.saturating_sub(previous).max(0) as f64;
+
+            quiet_gap_seconds.ln_1p().max(1.0)
+        })
+        .collect();
+    let total_weight = weights.iter().sum::<f64>();
+    let mut frames = Vec::with_capacity(commit_events.len());
+    let mut cumulative_weight = 0.0;
+
+    frames.push(0);
+    for (index, weight) in weights.iter().enumerate() {
+        cumulative_weight += weight;
+        let remaining_intervals = interval_count - index - 1;
+        let mut frame = ((cumulative_weight / total_weight) * target_frames as f64).round() as u64;
+        let previous_frame = *frames.last().expect("at least first frame exists");
+        frame = frame.max(previous_frame + 1);
+        if remaining_intervals == 0 {
+            frame = target_frames;
+        } else {
+            frame = frame.min(target_frames - remaining_intervals as u64);
+        }
+        frames.push(frame);
+    }
+
+    frames
+}
+
+fn explicit_target_end_frame(
+    duration: ReplayPacingDuration,
+    frames_per_second: u32,
+) -> Option<u64> {
+    match duration {
+        ReplayPacingDuration::Auto => None,
+        ReplayPacingDuration::Target { duration_seconds } => {
+            Some(u64::from(duration_seconds) * u64::from(frames_per_second))
+        }
+    }
+}
+
+fn target_frames(
+    duration: ReplayPacingDuration,
+    frames_per_second: u32,
+    interval_count: usize,
+) -> u64 {
+    match duration {
+        ReplayPacingDuration::Auto => {
+            u64::try_from(interval_count).expect("interval count fits u64")
+                * u64::from(frames_per_second)
+        }
+        ReplayPacingDuration::Target { duration_seconds } => {
+            let configured_target = u64::from(duration_seconds) * u64::from(frames_per_second);
+            configured_target.max(u64::try_from(interval_count).expect("interval count fits u64"))
+        }
+    }
+}
+
+fn file_change_offsets(file_change_count: usize, large_commit_window_frames: u64) -> Vec<u64> {
+    const LARGE_COMMIT_FILE_CHANGE_THRESHOLD: usize = 6;
+
+    if file_change_count < LARGE_COMMIT_FILE_CHANGE_THRESHOLD || large_commit_window_frames == 0 {
+        return vec![0; file_change_count];
+    }
+
+    let spread_steps = u64::try_from(file_change_count - 1).expect("file change count fits u64");
+    (0..file_change_count)
+        .map(|index| {
+            let index = u64::try_from(index).expect("file change index fits u64");
+            (index * large_commit_window_frames + spread_steps / 2) / spread_steps
+        })
+        .collect()
+}
+
+fn apply_file_change_offsets(file_changes: &mut [SceneFileChange], offsets: &[u64]) {
+    for (file_change, offset) in file_changes.iter_mut().zip(offsets) {
+        file_change.playback_frame_offset = *offset;
+    }
+}
+
+fn order_commit_events_by_parent_ids(
+    commit_events: Vec<(&CommitEvent, Vec<SceneFileChange>)>,
+) -> Vec<(&CommitEvent, Vec<SceneFileChange>)> {
+    let mut index_by_commit_id = BTreeMap::<String, usize>::new();
+    for (index, (commit_event, _)) in commit_events.iter().enumerate() {
+        index_by_commit_id.insert(commit_event.id().as_str().to_owned(), index);
+    }
+
+    let mut child_indexes_by_parent_index = BTreeMap::<usize, Vec<usize>>::new();
+    let mut visible_parent_counts = vec![0_usize; commit_events.len()];
+    for (child_index, (commit_event, _)) in commit_events.iter().enumerate() {
+        for parent_id in commit_event.parent_ids() {
+            if let Some(parent_index) = index_by_commit_id.get(parent_id.as_str()) {
+                visible_parent_counts[child_index] += 1;
+                child_indexes_by_parent_index
+                    .entry(*parent_index)
+                    .or_default()
+                    .push(child_index);
+            }
+        }
+    }
+
+    let mut ready_indexes = BTreeSet::<usize>::new();
+    for (index, visible_parent_count) in visible_parent_counts.iter().enumerate() {
+        if *visible_parent_count == 0 {
+            ready_indexes.insert(index);
+        }
+    }
+
+    let mut ordered_indexes = Vec::with_capacity(commit_events.len());
+    let mut ordered_index_set = BTreeSet::<usize>::new();
+    while let Some(index) = ready_indexes.pop_first() {
+        ordered_indexes.push(index);
+        ordered_index_set.insert(index);
+
+        if let Some(child_indexes) = child_indexes_by_parent_index.get(&index) {
+            for child_index in child_indexes {
+                visible_parent_counts[*child_index] -= 1;
+                if visible_parent_counts[*child_index] == 0 {
+                    ready_indexes.insert(*child_index);
+                }
+            }
+        }
+    }
+
+    if ordered_indexes.len() != commit_events.len() {
+        for index in 0..commit_events.len() {
+            if ordered_index_set.insert(index) {
+                ordered_indexes.push(index);
+            }
+        }
+    }
+
+    let mut commit_events_by_index: Vec<Option<(&CommitEvent, Vec<SceneFileChange>)>> =
+        commit_events.into_iter().map(Some).collect();
+    ordered_indexes
+        .into_iter()
+        .map(|index| {
+            commit_events_by_index[index]
+                .take()
+                .expect("ordered Commit Event index is unique")
+        })
+        .collect()
 }
 
 /// Render-ready Competing Change activity.
