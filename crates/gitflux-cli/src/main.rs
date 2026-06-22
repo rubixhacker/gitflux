@@ -8,7 +8,7 @@ use std::env;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use gitflux_export::{
     export_video_with_manifest_context, ExportManifest, ExportManifestContext,
@@ -22,8 +22,9 @@ use gitflux_preview::{
     PreviewReloadPolicy, PreviewReloadWatch, PreviewRunSummary, PreviewSessionPlan,
     PreviewWindowAdapter, PreviewWindowStatus,
 };
-use gitflux_render::{FrameCount, RenderPlan};
+use gitflux_render::{FrameCount, OffscreenRenderer, RenderPlan, RendererSettings};
 use gitflux_scene::{Layout, Mainline, RenderConfiguration, ReplayPacingDuration};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const HELP: &str = "\
@@ -33,6 +34,7 @@ Usage:
   gitflux [OPTIONS]
   gitflux render <repository-path> --output <output-path>
   gitflux preview <repository-path>
+  gitflux diagnostics <repository-path>
 
 Options:
   -h, --help       Print help
@@ -63,6 +65,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
         Some("-V") | Some("--version") => Ok(format!("gitflux {}\n", env!("CARGO_PKG_VERSION"))),
         Some("render") => run_render(args),
         Some("preview") => run_preview(args),
+        Some("diagnostics") | Some("doctor") => run_diagnostics(args),
         Some(flag) => Err(format!("unrecognized option: {flag}\n\n{HELP}")),
     }
 }
@@ -83,6 +86,19 @@ fn run_preview(args: impl IntoIterator<Item = String>) -> Result<String, String>
     let execution = execute_preview(&config)?;
 
     Ok(preview_human_summary(&config, &execution))
+}
+
+fn run_diagnostics(args: impl IntoIterator<Item = String>) -> Result<String, String> {
+    let config = parse_diagnostics_args(args)?;
+    let report = execute_diagnostics(&config);
+
+    if config.json {
+        return serde_json::to_string_pretty(&report)
+            .map(|json| format!("{json}\n"))
+            .map_err(|error| format!("failed to serialize diagnostics: {error}"));
+    }
+
+    Ok(diagnostics_human_summary(&report))
 }
 
 fn execute_render(config: &RenderCommand) -> Result<RenderExecution, String> {
@@ -156,6 +172,30 @@ fn execute_preview_with_adapter(
         summary,
         config_watcher,
     })
+}
+
+fn execute_diagnostics(config: &DiagnosticsCommand) -> DiagnosticsReport {
+    execute_diagnostics_with_probes(config, probe_gpu_backend, |binary| {
+        probe_ffmpeg_binary(binary)
+    })
+}
+
+fn execute_diagnostics_with_probes(
+    config: &DiagnosticsCommand,
+    gpu_probe: impl FnOnce() -> GpuDiagnostic,
+    ffmpeg_probe: impl FnOnce(&FfmpegBinary) -> FfmpegDiagnostic,
+) -> DiagnosticsReport {
+    let refs = inspect_repository_refs(config);
+    let cache = inspect_cache_readiness(&config.repository_path, &refs);
+
+    DiagnosticsReport {
+        schema_version: 1,
+        repository_path: config.repository_path.display().to_string(),
+        gpu: gpu_probe(),
+        ffmpeg: ffmpeg_probe(&config.ffmpeg_binary),
+        refs,
+        cache,
+    }
 }
 
 fn render_human_summary(config: &RenderCommand, execution: &RenderExecution) -> String {
@@ -235,6 +275,67 @@ fn preview_human_summary(config: &PreviewCommand, execution: &PreviewExecution) 
         "Config hot reload: {}\n",
         preview_reload_label(execution.summary.reload_watch(), execution.config_watcher)
     ));
+
+    output
+}
+
+fn diagnostics_human_summary(report: &DiagnosticsReport) -> String {
+    let mut output = String::new();
+
+    output.push_str("Gitflux Diagnostics\n");
+    output.push_str(&format!("Repository path: {}\n", report.repository_path));
+    output.push_str(&format!(
+        "GPU/backend: {}",
+        readiness_label(report.gpu.ready)
+    ));
+    if let Some(detail) = &report.gpu.detail {
+        output.push_str(&format!(" ({detail})"));
+    }
+    output.push('\n');
+    output.push_str(&format!(
+        "FFmpeg: {} at {}",
+        readiness_label(report.ffmpeg.available),
+        report.ffmpeg.path
+    ));
+    if let Some(version) = &report.ffmpeg.version {
+        output.push_str(&format!(" ({version})"));
+    }
+    if let Some(error) = &report.ffmpeg.error {
+        output.push_str(&format!(" ({error})"));
+    }
+    output.push('\n');
+    output.push_str(&format!("Ref selection: {}\n", report.refs.selection_mode));
+    output.push_str(&format!("Mainline: {}\n", report.refs.mainline));
+    if let Some(tip) = &report.refs.mainline_tip {
+        output.push_str(&format!("Mainline tip: {tip}\n"));
+    }
+    if let Some(head) = &report.refs.head {
+        output.push_str(&format!("HEAD: {head}\n"));
+    }
+    if !report.refs.local_branches.is_empty() {
+        output.push_str(&format!(
+            "Local branches: {}\n",
+            report.refs.local_branches.join(", ")
+        ));
+    }
+    if let Some(error) = &report.refs.error {
+        output.push_str(&format!("Ref diagnostics: {error}\n"));
+    }
+    output.push_str(&format!("Cache location: {}\n", report.cache.location));
+    output.push_str(&format!("Cache status: {}\n", report.cache.status));
+    output.push_str(&format!(
+        "Cache match policy: {}\n",
+        report.cache.match_policy
+    ));
+    output.push_str(&format!(
+        "Cache matches current inputs: {}\n",
+        match report.cache.matches_current_inputs {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        }
+    ));
+    output.push_str(&format!("Cache detail: {}\n", report.cache.detail));
 
     output
 }
@@ -352,6 +453,51 @@ fn parse_preview_args(args: impl IntoIterator<Item = String>) -> Result<PreviewC
     })
 }
 
+fn parse_diagnostics_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<DiagnosticsCommand, String> {
+    let mut args = args.into_iter();
+    let repository_path = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("missing repository path\n\n{HELP}"))?;
+    let mut ffmpeg_binary = FfmpegBinary::default();
+    let mut mainline = MainlineSelection::Detect;
+    let mut json = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--ffmpeg-path" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing FFmpeg path after --ffmpeg-path".to_owned())?;
+                ffmpeg_binary = FfmpegBinary::from_path(value);
+            }
+            "--mainline" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing Mainline name after --mainline".to_owned())?;
+                mainline = MainlineSelection::Explicit(Mainline::new(value));
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unrecognized diagnostics option: {flag}")),
+        }
+    }
+
+    if !repository_path.exists() {
+        return Err(missing_repository_path_error(&repository_path));
+    }
+
+    validate_repository_directory(&repository_path)?;
+
+    Ok(DiagnosticsCommand {
+        repository_path,
+        ffmpeg_binary,
+        mainline,
+        json,
+    })
+}
+
 fn load_render_configuration(
     config_path: Option<&PathBuf>,
     configuration_label: &str,
@@ -419,6 +565,58 @@ struct PreviewCommand {
 struct PreviewExecution {
     summary: PreviewRunSummary,
     config_watcher: bool,
+}
+
+struct DiagnosticsCommand {
+    repository_path: PathBuf,
+    ffmpeg_binary: FfmpegBinary,
+    mainline: MainlineSelection,
+    json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DiagnosticsReport {
+    schema_version: u32,
+    repository_path: String,
+    gpu: GpuDiagnostic,
+    ffmpeg: FfmpegDiagnostic,
+    refs: RefDiagnostic,
+    cache: CacheDiagnostic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GpuDiagnostic {
+    backend: String,
+    ready: bool,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct FfmpegDiagnostic {
+    path: String,
+    available: bool,
+    version: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RefDiagnostic {
+    selection_mode: String,
+    mainline: String,
+    mainline_tip: Option<String>,
+    head: Option<String>,
+    local_branches: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CacheDiagnostic {
+    location: String,
+    status: String,
+    match_policy: String,
+    current_inputs_key: String,
+    matches_current_inputs: Option<bool>,
+    detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +750,210 @@ impl PreviewCommand {
     }
 }
 
+impl DiagnosticsCommand {
+    fn ingestion_request(&self) -> RepositoryIngestionRequest {
+        match &self.mainline {
+            MainlineSelection::Detect => {
+                RepositoryIngestionRequest::detect_mainline(&self.repository_path)
+            }
+            MainlineSelection::Explicit(mainline) => {
+                RepositoryIngestionRequest::new(&self.repository_path, mainline.clone())
+            }
+        }
+    }
+}
+
+fn probe_gpu_backend() -> GpuDiagnostic {
+    match OffscreenRenderer::new(RendererSettings::default()) {
+        Ok(_) => GpuDiagnostic {
+            backend: "wgpu-offscreen".to_owned(),
+            ready: true,
+            detail: Some("offscreen renderer initialized".to_owned()),
+        },
+        Err(error) => GpuDiagnostic {
+            backend: "wgpu-offscreen".to_owned(),
+            ready: false,
+            detail: Some(error.to_string()),
+        },
+    }
+}
+
+fn probe_ffmpeg_binary(binary: &FfmpegBinary) -> FfmpegDiagnostic {
+    match Command::new(binary.path()).arg("-version").output() {
+        Ok(output) if output.status.success() => {
+            let version =
+                first_nonempty_line(&output.stdout).or_else(|| first_nonempty_line(&output.stderr));
+
+            if version
+                .as_deref()
+                .is_some_and(|line| line.starts_with("ffmpeg version "))
+            {
+                FfmpegDiagnostic {
+                    path: binary.path().display().to_string(),
+                    available: true,
+                    version,
+                    error: None,
+                }
+            } else {
+                FfmpegDiagnostic {
+                    path: binary.path().display().to_string(),
+                    available: false,
+                    version: None,
+                    error: Some(
+                        version
+                            .map(|line| {
+                                format!(
+                                    "version probe did not produce recognizable FFmpeg output: {line}"
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                "version probe did not produce recognizable FFmpeg output"
+                                    .to_owned()
+                            }),
+                    ),
+                }
+            }
+        }
+        Ok(output) => FfmpegDiagnostic {
+            path: binary.path().display().to_string(),
+            available: false,
+            version: None,
+            error: Some(format!(
+                "version probe exited with {}{}",
+                output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_owned()),
+                command_output_detail(&output.stderr)
+            )),
+        },
+        Err(error) => FfmpegDiagnostic {
+            path: binary.path().display().to_string(),
+            available: false,
+            version: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn first_nonempty_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn command_output_detail(bytes: &[u8]) -> String {
+    first_nonempty_line(bytes)
+        .map(|line| format!(": {line}"))
+        .unwrap_or_default()
+}
+
+fn inspect_repository_refs(config: &DiagnosticsCommand) -> RefDiagnostic {
+    let mut diagnostic = RefDiagnostic {
+        selection_mode: config.mainline.selection_mode().to_owned(),
+        mainline: config.mainline.as_label().to_owned(),
+        mainline_tip: None,
+        head: None,
+        local_branches: Vec::new(),
+        error: None,
+    };
+
+    let repository = match git2::Repository::open(&config.repository_path) {
+        Ok(repository) => repository,
+        Err(error) => {
+            diagnostic.error = Some(format!("failed to open Git repository: {error}"));
+            return diagnostic;
+        }
+    };
+
+    diagnostic.head = repository.head().ok().and_then(|head| {
+        head.shorthand()
+            .map(ToOwned::to_owned)
+            .or_else(|| head.target().map(|target| target.to_string()))
+    });
+    diagnostic.local_branches = local_branch_names(&repository);
+
+    match ingest_repository(&config.ingestion_request()) {
+        Ok(summary) => {
+            diagnostic.mainline = summary.replay().mainline().as_str().to_owned();
+            diagnostic.mainline_tip = mainline_tip(&repository, summary.replay().mainline());
+        }
+        Err(error) => {
+            diagnostic.error = Some(error.to_string());
+        }
+    }
+
+    diagnostic
+}
+
+fn local_branch_names(repository: &git2::Repository) -> Vec<String> {
+    let mut branches = Vec::new();
+    if let Ok(iter) = repository.branches(Some(git2::BranchType::Local)) {
+        for branch in iter.flatten() {
+            if let Ok(Some(name)) = branch.0.name() {
+                branches.push(name.to_owned());
+            }
+        }
+    }
+    branches.sort();
+    branches
+}
+
+fn mainline_tip(repository: &git2::Repository, mainline: &Mainline) -> Option<String> {
+    repository
+        .revparse_single(&format!("refs/heads/{}", mainline.as_str()))
+        .ok()
+        .map(|object| object.id().to_string())
+}
+
+fn inspect_cache_readiness(repository_path: &Path, refs: &RefDiagnostic) -> CacheDiagnostic {
+    let location = git2::Repository::open(repository_path)
+        .ok()
+        .map(|repository| repository.path().join("gitflux").join("cache"))
+        .unwrap_or_else(|| repository_path.join(".git").join("gitflux").join("cache"));
+    let status = if location.exists() {
+        "present_without_metadata"
+    } else {
+        "not_present"
+    };
+    let current_inputs_key = diagnostic_inputs_key(repository_path, refs);
+
+    CacheDiagnostic {
+        location: location.display().to_string(),
+        status: status.to_owned(),
+        match_policy: "disabled_until_cache_metadata_exists".to_owned(),
+        current_inputs_key,
+        matches_current_inputs: Some(false),
+        detail: "Gitflux has no cache metadata subsystem yet, so diagnostics cannot claim any cached data matches the current repository inputs.".to_owned(),
+    }
+}
+
+fn diagnostic_inputs_key(repository_path: &Path, refs: &RefDiagnostic) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(repository_path.display().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(refs.selection_mode.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(refs.mainline.as_bytes());
+    hasher.update(b"\0");
+    if let Some(tip) = &refs.mainline_tip {
+        hasher.update(tip.as_bytes());
+    }
+
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn readiness_label(ready: bool) -> &'static str {
+    if ready {
+        "ready"
+    } else {
+        "unavailable"
+    }
+}
+
 fn render_phase_label(phase: ExportProgressPhase) -> &'static str {
     match phase {
         ExportProgressPhase::Ingestion => "Repository Ingestion",
@@ -607,8 +1009,9 @@ fn preview_reload_label(status: PreviewReloadWatch, watcher_initialized: bool) -
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_preview_with_adapter, parse_preview_args, parse_render_args, preview_human_summary,
-        run,
+        diagnostics_human_summary, execute_diagnostics_with_probes, execute_preview_with_adapter,
+        parse_diagnostics_args, parse_preview_args, parse_render_args, preview_human_summary,
+        probe_ffmpeg_binary, run, FfmpegBinary, FfmpegDiagnostic, GpuDiagnostic,
     };
     use gitflux_preview::{PlanningPreviewWindowAdapter, PreviewReloadPolicy};
     use std::fs;
@@ -1081,6 +1484,179 @@ settle_iterations = 80
     }
 
     #[test]
+    fn diagnostics_reports_human_readable_readiness() {
+        let fixture = CliGitFixture::new("diagnostics-human");
+        let ffmpeg = write_fake_ffmpeg("diagnostics-human");
+        let command = parse_diagnostics_args([
+            fixture.path().display().to_string(),
+            "--ffmpeg-path".to_owned(),
+            ffmpeg.display().to_string(),
+        ])
+        .expect("diagnostics command should parse");
+        let report = execute_diagnostics_with_probes(
+            &command,
+            || GpuDiagnostic {
+                backend: "test-gpu".to_owned(),
+                ready: true,
+                detail: Some("test backend initialized".to_owned()),
+            },
+            |_| FfmpegDiagnostic {
+                path: ffmpeg.display().to_string(),
+                available: true,
+                version: Some("ffmpeg version test".to_owned()),
+                error: None,
+            },
+        );
+        let output = diagnostics_human_summary(&report);
+
+        assert!(output.contains("Gitflux Diagnostics"));
+        assert!(output.contains("GPU/backend: ready (test backend initialized)"));
+        assert!(output.contains("FFmpeg: ready"));
+        assert!(output.contains("ffmpeg version test"));
+        assert!(output.contains("Ref selection: detected"));
+        assert!(output.contains("Mainline: main"));
+        assert!(output.contains("Mainline tip:"));
+        assert!(output.contains("Local branches: main"));
+        assert!(output.contains("Cache location:"));
+        assert!(output.contains("Cache matches current inputs: no"));
+    }
+
+    #[test]
+    fn diagnostics_json_serializes_typed_report() {
+        let fixture = CliGitFixture::new("diagnostics-json");
+        let ffmpeg = write_fake_ffmpeg("diagnostics-json");
+        let command = parse_diagnostics_args([
+            fixture.path().display().to_string(),
+            "--ffmpeg-path".to_owned(),
+            ffmpeg.display().to_string(),
+            "--json".to_owned(),
+        ])
+        .expect("diagnostics command should parse");
+        let report = execute_diagnostics_with_probes(
+            &command,
+            || GpuDiagnostic {
+                backend: "test-gpu".to_owned(),
+                ready: false,
+                detail: Some("not available in test".to_owned()),
+            },
+            |_| FfmpegDiagnostic {
+                path: ffmpeg.display().to_string(),
+                available: true,
+                version: Some("ffmpeg version test".to_owned()),
+                error: None,
+            },
+        );
+        let json = serde_json::to_value(&report).expect("diagnostics should serialize");
+
+        assert_eq!(json["schema_version"].as_u64(), Some(1));
+        assert_eq!(json["gpu"]["ready"].as_bool(), Some(false));
+        assert_eq!(json["ffmpeg"]["available"].as_bool(), Some(true));
+        assert_eq!(
+            json["ffmpeg"]["version"].as_str(),
+            Some("ffmpeg version test")
+        );
+        assert_eq!(json["refs"]["selection_mode"].as_str(), Some("detected"));
+        assert_eq!(json["refs"]["mainline"].as_str(), Some("main"));
+        assert!(json["refs"]["mainline_tip"]
+            .as_str()
+            .is_some_and(|tip| tip.len() == 40));
+        assert_eq!(
+            json["cache"]["match_policy"].as_str(),
+            Some("disabled_until_cache_metadata_exists")
+        );
+        assert_eq!(
+            json["cache"]["matches_current_inputs"].as_bool(),
+            Some(false)
+        );
+        assert!(json["cache"]["current_inputs_key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("sha256:")));
+    }
+
+    #[test]
+    fn diagnostics_supports_explicit_mainline_override() {
+        let fixture = CliGitFixture::new("diagnostics-mainline");
+        run_git(fixture.path(), ["checkout", "-b", "release"]);
+        fs::write(fixture.path().join("RELEASE.md"), "release\n")
+            .expect("release file should be written");
+        run_git(fixture.path(), ["add", "RELEASE.md"]);
+        run_git(
+            fixture.path(),
+            ["commit", "--no-gpg-sign", "-m", "Release commit"],
+        );
+        let command = parse_diagnostics_args([
+            fixture.path().display().to_string(),
+            "--mainline".to_owned(),
+            "release".to_owned(),
+        ])
+        .expect("diagnostics command should parse");
+        let report = execute_diagnostics_with_probes(
+            &command,
+            || GpuDiagnostic {
+                backend: "test-gpu".to_owned(),
+                ready: true,
+                detail: None,
+            },
+            |_| FfmpegDiagnostic {
+                path: "ffmpeg".to_owned(),
+                available: false,
+                version: None,
+                error: Some("not tested".to_owned()),
+            },
+        );
+
+        assert_eq!(report.refs.selection_mode, "explicit");
+        assert_eq!(report.refs.mainline, "release");
+        assert!(report.refs.mainline_tip.is_some());
+        assert!(report
+            .refs
+            .local_branches
+            .iter()
+            .any(|branch| branch == "main"));
+        assert!(report
+            .refs
+            .local_branches
+            .iter()
+            .any(|branch| branch == "release"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn diagnostics_rejects_successful_non_ffmpeg_version_probe() {
+        let binary = write_executable_script(
+            "diagnostics-not-ffmpeg",
+            "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then printf 'true 1.0\\n'; exit 0; fi\nexit 0\n",
+        );
+
+        let diagnostic = probe_ffmpeg_binary(&FfmpegBinary::from_path(binary));
+
+        assert!(!diagnostic.available);
+        assert_eq!(diagnostic.version, None);
+        assert!(diagnostic
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("recognizable FFmpeg output")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn diagnostics_rejects_empty_successful_ffmpeg_probe() {
+        let binary = write_executable_script(
+            "diagnostics-empty-version",
+            "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then exit 0; fi\nexit 0\n",
+        );
+
+        let diagnostic = probe_ffmpeg_binary(&FfmpegBinary::from_path(binary));
+
+        assert!(!diagnostic.available);
+        assert_eq!(diagnostic.version, None);
+        assert!(diagnostic
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("recognizable FFmpeg output")));
+    }
+
+    #[test]
     fn identical_config_contents_have_stable_hash_across_paths() {
         let fixture = CliGitFixture::new("config-hash");
         let contents = r##"
@@ -1215,23 +1791,27 @@ settle_iterations = 80
 
     #[cfg(unix)]
     fn write_fake_ffmpeg(name: &str) -> PathBuf {
+        write_executable_script(
+            &format!("cli-fake-ffmpeg-{name}"),
+            "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then printf 'ffmpeg version fake\\n'; exit 0; fi\nfor output_path do :; done\nprintf 'video\\n' > \"$output_path\"\n",
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(name: &str, contents: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let path = std::env::temp_dir().join(format!(
-            "gitflux-cli-fake-ffmpeg-{name}-{}-{}",
+            "gitflux-{name}-{}-{}",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
-        fs::write(
-            &path,
-            "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then exit 0; fi\nfor output_path do :; done\nprintf 'video\\n' > \"$output_path\"\n",
-        )
-        .expect("fake FFmpeg should be written");
+        fs::write(&path, contents).expect("script should be written");
         let mut permissions = fs::metadata(&path)
-            .expect("fake FFmpeg metadata should be readable")
+            .expect("script metadata should be readable")
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("fake FFmpeg should be executable");
+        fs::set_permissions(&path, permissions).expect("script should be executable");
         path
     }
 

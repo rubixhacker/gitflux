@@ -459,6 +459,7 @@ dependencies = [
  "gitflux-preview",
  "gitflux-render",
  "gitflux-scene",
+ "serde",
  "serde_json",
  "sha2",
 ]
