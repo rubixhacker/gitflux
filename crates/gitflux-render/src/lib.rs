@@ -691,27 +691,27 @@ impl RenderBatches {
         let transform = SceneTransform::from_scene(scene);
         let entity_color = color_from_hex(theme.entity_color().as_hex());
         let contributor_color = color_from_hex(theme.contributor_color().as_hex());
-        let directory_color = scale_color(entity_color, 0.64, 0.88);
-        let summary_color = scale_color(entity_color, 0.44, 0.70);
-        let activity_color = [1.0, 1.0, 1.0, 0.96];
+        let directory_color = scale_color(entity_color, 0.58, 0.72);
+        let summary_color = scale_color(entity_color, 0.40, 0.56);
+        let activity_color = [1.0, 1.0, 1.0, 0.42];
         let active_file_ids = active_file_ids(scene, frame_index);
 
         let mut contributors = RenderBatch::new(RenderBatchKind::Contributor);
-        let contributor_size = transform.size_to_clip_space(20.0, 20.0);
+        let contributor_size = transform.size_to_clip_space(16.0, 16.0);
         for contributor in scene.contributors() {
             let (x, y) = transform.to_pixels(contributor.position());
             contributors.push_rect(x, y, contributor_size, contributor_color);
         }
 
         let mut directories = RenderBatch::new(RenderBatchKind::Directory);
-        let directory_size = transform.size_to_clip_space(22.0, 14.0);
+        let directory_size = transform.size_to_clip_space(24.0, 8.0);
         for directory in scene.directories() {
             let (x, y) = transform.to_pixels(directory.position());
             directories.push_rect(x, y, directory_size, directory_color);
         }
 
         let mut files = RenderBatch::new(RenderBatchKind::File);
-        let file_size = transform.size_to_clip_space(14.0, 14.0);
+        let file_size = transform.size_to_clip_space(8.0, 8.0);
         let mut file_positions = BTreeMap::new();
         for file in scene.files() {
             let (x, y) = transform.to_pixels(file.position());
@@ -731,7 +731,7 @@ impl RenderBatches {
         let mut summaries = RenderBatch::new(RenderBatchKind::Summary);
         for summary in scene.visual_summaries() {
             let (x, y) = transform.to_pixels(summary.position());
-            let size = 16.0 + summary.weight().get().min(8) as f32;
+            let size = 14.0 + summary.weight().get().min(8) as f32;
             summaries.push_rect(
                 x,
                 y,
@@ -741,7 +741,7 @@ impl RenderBatches {
         }
 
         let mut activities = RenderBatch::new(RenderBatchKind::Activity);
-        let activity_size = transform.size_to_clip_space(24.0, 24.0);
+        let activity_size = transform.size_to_clip_space(10.0, 10.0);
         for file_id in active_file_ids {
             if let Some((x, y)) = file_positions.get(&file_id) {
                 activities.push_rect(*x, *y, activity_size, activity_color);
@@ -1001,11 +1001,152 @@ fn apply_readability_overlay(
     let palette = OverlayPalette::from_theme(theme);
     let transform = SceneTransform::from_scene(scene);
 
+    draw_constellation_field(pixels, frame_size, scene, transform, frame_index, palette);
     draw_graph_context(pixels, frame_size, scene, transform, palette);
+    draw_repository_marks(pixels, frame_size, scene, transform, frame_index, palette);
     draw_title_and_progress(pixels, frame_size, scene, frame_index, palette);
     draw_legend(pixels, frame_size, palette);
     draw_scene_labels(pixels, frame_size, scene, transform, palette);
     draw_current_activity_caption(pixels, frame_size, scene, frame_index, palette);
+}
+
+fn draw_constellation_field(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    scene: &RepositoryGraphScene,
+    transform: SceneTransform,
+    frame_index: FrameIndex,
+    palette: OverlayPalette,
+) {
+    for x in (64..frame_size.width() as i32).step_by(96) {
+        draw_line(
+            pixels,
+            frame_size,
+            FramePoint::new(x as f32, 120.0),
+            FramePoint::new(x as f32, frame_size.height() as f32 - 132.0),
+            palette.grid_line,
+        );
+    }
+    for y in (138..frame_size.height() as i32 - 130).step_by(72) {
+        draw_line(
+            pixels,
+            frame_size,
+            FramePoint::new(32.0, y as f32),
+            FramePoint::new(frame_size.width() as f32 - 32.0, y as f32),
+            palette.grid_line,
+        );
+    }
+
+    let file_positions: BTreeMap<String, FramePoint> = scene
+        .files()
+        .iter()
+        .map(|file| {
+            (
+                file.id().as_str().to_owned(),
+                transform.to_frame_pixels(file.position()),
+            )
+        })
+        .collect();
+    let contributor_positions: BTreeMap<String, FramePoint> = scene
+        .contributors()
+        .iter()
+        .map(|contributor| {
+            (
+                contributor.id().as_str().to_owned(),
+                transform.to_frame_pixels(contributor.position()),
+            )
+        })
+        .collect();
+
+    for contributor in scene.contributors() {
+        let point = transform.to_frame_pixels(contributor.position());
+        draw_disc(pixels, frame_size, point, 22, palette.contributor_glow);
+        draw_ring(pixels, frame_size, point, 13, palette.contributor_ring);
+    }
+
+    for summary in scene.visual_summaries() {
+        let point = transform.to_frame_pixels(summary.position());
+        let radius = 18 + summary.weight().get().min(9) as i32;
+        draw_disc(pixels, frame_size, point, radius + 10, palette.entity_glow);
+        draw_ring(pixels, frame_size, point, radius, palette.entity_ring);
+    }
+
+    let active_ids = active_file_ids(scene, frame_index);
+    for activity in scene
+        .activities()
+        .iter()
+        .filter(|activity| activity_is_current(activity.playback_frame(), frame_index))
+    {
+        if let Some(contributor) = contributor_positions.get(activity.contributor_id().as_str()) {
+            for file_change in activity.file_changes() {
+                let file_id = file_change.file_id().as_str();
+                let Some(file_point) = file_positions.get(file_id) else {
+                    continue;
+                };
+                draw_line(
+                    pixels,
+                    frame_size,
+                    *contributor,
+                    *file_point,
+                    palette.activity_beam,
+                );
+            }
+        }
+    }
+
+    for file_id in active_ids {
+        if let Some(point) = file_positions.get(&file_id) {
+            draw_disc(pixels, frame_size, *point, 22, palette.activity_glow_outer);
+            draw_disc(pixels, frame_size, *point, 13, palette.activity_glow_inner);
+            draw_ring(pixels, frame_size, *point, 17, palette.activity_ring);
+        }
+    }
+}
+
+fn activity_is_current(activity_frame: u64, frame_index: FrameIndex) -> bool {
+    let frame = frame_index.get();
+    frame >= activity_frame && frame.saturating_sub(activity_frame) <= 18
+}
+
+fn draw_repository_marks(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    scene: &RepositoryGraphScene,
+    transform: SceneTransform,
+    frame_index: FrameIndex,
+    palette: OverlayPalette,
+) {
+    for directory in scene.directories() {
+        let point = transform.to_frame_pixels(directory.position());
+        draw_capsule(pixels, frame_size, point, 28, 8, palette.directory_node);
+    }
+
+    for file in scene.files() {
+        let point = transform.to_frame_pixels(file.position());
+        let color = match file.emphasis() {
+            SceneEmphasis::Normal => palette.file_node,
+            SceneEmphasis::DeEmphasized => palette.file_node_muted,
+        };
+        draw_disc(pixels, frame_size, point, 5, color);
+    }
+
+    for contributor in scene.contributors() {
+        let point = transform.to_frame_pixels(contributor.position());
+        draw_disc(pixels, frame_size, point, 8, palette.contributor);
+        draw_ring(pixels, frame_size, point, 12, palette.contributor_ring);
+    }
+
+    for file_id in active_file_ids(scene, frame_index) {
+        let Some(file) = scene
+            .files()
+            .iter()
+            .find(|file| file.id().as_str() == file_id)
+        else {
+            continue;
+        };
+        let point = transform.to_frame_pixels(file.position());
+        draw_disc(pixels, frame_size, point, 7, palette.activity_core);
+    }
 }
 
 fn draw_graph_context(
@@ -1048,10 +1189,10 @@ fn draw_graph_context(
         draw_text(
             pixels,
             frame_size,
-            "DIRECTORIES",
+            "DIRECTORY LANE",
             32,
-            (point.y - 28.0).round() as i32,
-            2,
+            (point.y - 24.0).round() as i32,
+            1,
             palette.muted_text,
         );
     }
@@ -1060,10 +1201,10 @@ fn draw_graph_context(
         draw_text(
             pixels,
             frame_size,
-            "FILES / CHANGES",
+            "CHANGE STREAM",
             32,
-            (point.y - 26.0).round() as i32,
-            2,
+            (point.y - 22.0).round() as i32,
+            1,
             palette.muted_text,
         );
     }
@@ -1226,27 +1367,6 @@ fn draw_scene_labels(
             )
         })
         .collect();
-    let directory_positions: BTreeMap<String, FramePoint> = scene
-        .directories()
-        .iter()
-        .map(|directory| {
-            (
-                directory.id().as_str().to_owned(),
-                transform.to_frame_pixels(directory.position()),
-            )
-        })
-        .collect();
-    let summary_positions: BTreeMap<String, FramePoint> = scene
-        .visual_summaries()
-        .iter()
-        .map(|summary| {
-            (
-                summary.id().as_str().to_owned(),
-                transform.to_frame_pixels(summary.position()),
-            )
-        })
-        .collect();
-
     for label in scene.labels() {
         match label.target() {
             SceneLabelTarget::Contributor(contributor_id)
@@ -1258,59 +1378,11 @@ fn draw_scene_labels(
                         frame_size,
                         *point,
                         &shorten_text(label.text(), 20),
-                        LabelPlacement::Above,
-                        palette,
-                    );
-                }
-            }
-            SceneLabelTarget::Directory(directory_id)
-                if label.kind() == SceneLabelKind::DirectoryPath =>
-            {
-                if let Some(point) = directory_positions.get(directory_id.as_str()) {
-                    draw_anchor_label(
-                        pixels,
-                        frame_size,
-                        *point,
-                        &shorten_text(label.text(), 18),
-                        LabelPlacement::Below,
-                        palette,
-                    );
-                }
-            }
-            SceneLabelTarget::VisualSummary(summary_id)
-                if label.kind() == SceneLabelKind::SummaryPath =>
-            {
-                if let Some(point) = summary_positions.get(summary_id.as_str()) {
-                    draw_anchor_label(
-                        pixels,
-                        frame_size,
-                        *point,
-                        &shorten_text(label.text(), 20),
-                        LabelPlacement::Below,
                         palette,
                     );
                 }
             }
             _ => {}
-        }
-    }
-
-    if scene.labels().iter().all(|label| {
-        !matches!(
-            label.kind(),
-            SceneLabelKind::DirectoryPath | SceneLabelKind::SummaryPath
-        )
-    }) {
-        for directory in scene.directories().iter().take(6) {
-            let point = transform.to_frame_pixels(directory.position());
-            draw_anchor_label(
-                pixels,
-                frame_size,
-                point,
-                &shorten_text(directory.path(), 18),
-                LabelPlacement::Below,
-                palette,
-            );
         }
     }
 }
@@ -1320,16 +1392,12 @@ fn draw_anchor_label(
     frame_size: RenderFrameSize,
     point: FramePoint,
     text: &str,
-    placement: LabelPlacement,
     palette: OverlayPalette,
 ) {
     let text_width = text_pixel_width(text, 1);
     let x = (point.x.round() as i32 - text_width / 2)
         .clamp(28, frame_size.width() as i32 - text_width - 28);
-    let y = match placement {
-        LabelPlacement::Above => point.y.round() as i32 - 28,
-        LabelPlacement::Below => point.y.round() as i32 + 16,
-    };
+    let y = point.y.round() as i32 - 28;
     draw_rect(
         pixels,
         frame_size,
@@ -1452,12 +1520,6 @@ fn shorten_text(text: &str, max_chars: usize) -> String {
     output
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LabelPlacement {
-    Above,
-    Below,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct FramePoint {
     x: f32,
@@ -1498,11 +1560,24 @@ struct OverlayPalette {
     panel_strong: OverlayColor,
     label_backing: OverlayColor,
     rail: OverlayColor,
+    grid_line: OverlayColor,
     structure_line: OverlayColor,
     accent: OverlayColor,
     contributor: OverlayColor,
     entity: OverlayColor,
     activity: OverlayColor,
+    directory_node: OverlayColor,
+    file_node: OverlayColor,
+    file_node_muted: OverlayColor,
+    activity_core: OverlayColor,
+    contributor_glow: OverlayColor,
+    contributor_ring: OverlayColor,
+    entity_glow: OverlayColor,
+    entity_ring: OverlayColor,
+    activity_beam: OverlayColor,
+    activity_glow_outer: OverlayColor,
+    activity_glow_inner: OverlayColor,
+    activity_ring: OverlayColor,
 }
 
 impl OverlayPalette {
@@ -1515,13 +1590,36 @@ impl OverlayPalette {
             muted_text: OverlayColor::rgba(166, 190, 205, 180),
             panel: OverlayColor::rgba(6, 12, 20, 146),
             panel_strong: OverlayColor::rgba(5, 10, 16, 204),
-            label_backing: OverlayColor::rgba(5, 10, 16, 178),
+            label_backing: OverlayColor::rgba(5, 10, 16, 132),
             rail: OverlayColor::rgba(160, 184, 202, 86),
-            structure_line: OverlayColor::rgba(188, 214, 230, 52),
+            grid_line: OverlayColor::rgba(188, 214, 230, 14),
+            structure_line: OverlayColor::rgba(188, 214, 230, 34),
             accent: OverlayColor::rgba(entity[0], entity[1], entity[2], 232),
             contributor: OverlayColor::rgba(contributor[0], contributor[1], contributor[2], 232),
             entity: OverlayColor::rgba(entity[0], entity[1], entity[2], 220),
             activity: OverlayColor::rgba(255, 255, 255, 240),
+            directory_node: OverlayColor::rgba(entity[0], entity[1], entity[2], 158),
+            file_node: OverlayColor::rgba(entity[0], entity[1], entity[2], 226),
+            file_node_muted: OverlayColor::rgba(entity[0], entity[1], entity[2], 118),
+            activity_core: OverlayColor::rgba(255, 255, 255, 236),
+            contributor_glow: OverlayColor::rgba(
+                contributor[0],
+                contributor[1],
+                contributor[2],
+                28,
+            ),
+            contributor_ring: OverlayColor::rgba(
+                contributor[0],
+                contributor[1],
+                contributor[2],
+                150,
+            ),
+            entity_glow: OverlayColor::rgba(entity[0], entity[1], entity[2], 18),
+            entity_ring: OverlayColor::rgba(entity[0], entity[1], entity[2], 96),
+            activity_beam: OverlayColor::rgba(255, 255, 255, 42),
+            activity_glow_outer: OverlayColor::rgba(entity[0], entity[1], entity[2], 34),
+            activity_glow_inner: OverlayColor::rgba(255, 255, 255, 56),
+            activity_ring: OverlayColor::rgba(255, 255, 255, 188),
         }
     }
 }
@@ -1566,6 +1664,87 @@ fn draw_line(
             y0 += sy;
         }
     }
+}
+
+fn draw_disc(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    center: FramePoint,
+    radius: i32,
+    color: OverlayColor,
+) {
+    let center_x = center.x.round() as i32;
+    let center_y = center.y.round() as i32;
+    let radius_squared = radius * radius;
+    for y in center_y - radius..=center_y + radius {
+        for x in center_x - radius..=center_x + radius {
+            let dx = x - center_x;
+            let dy = y - center_y;
+            if dx * dx + dy * dy <= radius_squared {
+                blend_pixel(pixels, frame_size, x, y, color);
+            }
+        }
+    }
+}
+
+fn draw_ring(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    center: FramePoint,
+    radius: i32,
+    color: OverlayColor,
+) {
+    let center_x = center.x.round() as i32;
+    let center_y = center.y.round() as i32;
+    let outer = radius * radius;
+    let inner_radius = (radius - 2).max(1);
+    let inner = inner_radius * inner_radius;
+    for y in center_y - radius..=center_y + radius {
+        for x in center_x - radius..=center_x + radius {
+            let dx = x - center_x;
+            let dy = y - center_y;
+            let distance = dx * dx + dy * dy;
+            if (inner..=outer).contains(&distance) {
+                blend_pixel(pixels, frame_size, x, y, color);
+            }
+        }
+    }
+}
+
+fn draw_capsule(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    center: FramePoint,
+    width: i32,
+    height: i32,
+    color: OverlayColor,
+) {
+    let radius = (height / 2).max(1);
+    let center_x = center.x.round() as i32;
+    let center_y = center.y.round() as i32;
+    draw_rect(
+        pixels,
+        frame_size,
+        center_x - width / 2 + radius,
+        center_y - height / 2,
+        width - radius * 2,
+        height,
+        color,
+    );
+    draw_disc(
+        pixels,
+        frame_size,
+        FramePoint::new((center_x - width / 2 + radius) as f32, center_y as f32),
+        radius,
+        color,
+    );
+    draw_disc(
+        pixels,
+        frame_size,
+        FramePoint::new((center_x + width / 2 - radius) as f32, center_y as f32),
+        radius,
+        color,
+    );
 }
 
 fn draw_rect(
