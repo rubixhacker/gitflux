@@ -4,21 +4,21 @@
 //! Repository Replay timeline. The current scaffold defines the public request
 //! and summary types without choosing the concrete Git library integration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use git2::{Delta, DiffFindOptions, DiffOptions, Oid, Repository, Sort};
+use git2::{BranchType, Delta, DiffFindOptions, DiffOptions, Oid, Repository, Sort};
 use gitflux_scene::{
-    CommitEvent, CommitEvidence, CommitId, CommitSubject, Contributor, ContributorEvidence,
-    ContributorKind, FileChange, FileChangeKind, GitTimestamp, Mainline, RepositoryEntity,
-    RepositoryReplay,
+    BranchFlow, CommitEvent, CommitEvidence, CommitId, CommitSubject, Contributor,
+    ContributorEvidence, ContributorKind, FileChange, FileChangeKind, GitTimestamp, Mainline,
+    MergeSettlement, RepositoryEntity, RepositoryReplay,
 };
 
 /// Input for preparing Git history into a Repository Replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryIngestionRequest {
     repository_path: PathBuf,
-    mainline: Mainline,
+    mainline: MainlineSelection,
     contributor_normalization: ContributorNormalizationRules,
 }
 
@@ -28,7 +28,17 @@ impl RepositoryIngestionRequest {
     pub fn new(repository_path: impl Into<PathBuf>, mainline: Mainline) -> Self {
         Self {
             repository_path: repository_path.into(),
-            mainline,
+            mainline: MainlineSelection::Explicit(mainline),
+            contributor_normalization: ContributorNormalizationRules::default(),
+        }
+    }
+
+    /// Creates a Repository Ingestion request that detects the Mainline from local refs.
+    #[must_use]
+    pub fn detect_mainline(repository_path: impl Into<PathBuf>) -> Self {
+        Self {
+            repository_path: repository_path.into(),
+            mainline: MainlineSelection::DetectFromLocalRefs,
             contributor_normalization: ContributorNormalizationRules::default(),
         }
     }
@@ -39,10 +49,13 @@ impl RepositoryIngestionRequest {
         &self.repository_path
     }
 
-    /// Returns the Mainline for replay settlement.
+    /// Returns the explicit Mainline override, if one was supplied.
     #[must_use]
-    pub fn mainline(&self) -> &Mainline {
-        &self.mainline
+    pub fn explicit_mainline(&self) -> Option<&Mainline> {
+        match &self.mainline {
+            MainlineSelection::Explicit(mainline) => Some(mainline),
+            MainlineSelection::DetectFromLocalRefs => None,
+        }
     }
 
     /// Sets Contributor normalization rules for Repository Ingestion.
@@ -60,6 +73,12 @@ impl RepositoryIngestionRequest {
     pub fn contributor_normalization(&self) -> &ContributorNormalizationRules {
         &self.contributor_normalization
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MainlineSelection {
+    Explicit(Mainline),
+    DetectFromLocalRefs,
 }
 
 /// Typed rules used to normalize raw Git signatures into Contributors.
@@ -271,12 +290,19 @@ impl RepositoryIngestionSummary {
     }
 }
 
-/// Builds an empty Repository Replay shell for the requested Mainline.
-#[must_use]
+/// Builds an empty Repository Replay shell for an explicit Mainline.
 pub fn scaffold_repository_replay(
     request: &RepositoryIngestionRequest,
-) -> RepositoryIngestionSummary {
-    RepositoryIngestionSummary::new(RepositoryReplay::new(request.mainline().clone()))
+) -> Result<RepositoryIngestionSummary, RepositoryIngestionError> {
+    let mainline = request.explicit_mainline().ok_or_else(|| {
+        RepositoryIngestionError::new(
+            "Mainline must be explicit before scaffolding Repository Replay",
+        )
+    })?;
+
+    Ok(RepositoryIngestionSummary::new(RepositoryReplay::new(
+        mainline.clone(),
+    )))
 }
 
 /// Ingests a local Git repository into Repository Replay events.
@@ -284,14 +310,15 @@ pub fn ingest_repository(
     request: &RepositoryIngestionRequest,
 ) -> Result<RepositoryIngestionSummary, RepositoryIngestionError> {
     let git_repository = NativeGitRepository::open(request.repository_path())?;
-    let commit_ids = git_repository.mainline_commit_ids(request.mainline())?;
-    let mut replay = RepositoryReplay::new(request.mainline().clone());
+    let mainline = git_repository.resolve_mainline(&request.mainline)?;
+    let commit_plan = git_repository.commit_plan(&mainline)?;
+    let mut replay = RepositoryReplay::new(mainline);
     let mut contributor_normalizer =
         ContributorNormalizer::new(request.contributor_normalization());
 
-    for commit_id in commit_ids {
+    for planned_commit in commit_plan {
         replay.push_commit_event(
-            git_repository.commit_event(commit_id, &mut contributor_normalizer)?,
+            git_repository.commit_event(planned_commit, &mut contributor_normalizer)?,
         );
     }
 
@@ -330,6 +357,18 @@ struct NativeGitRepository {
     repository: Repository,
 }
 
+#[derive(Debug, Clone)]
+struct PlannedCommit {
+    id: Oid,
+    branch_flow: BranchFlow,
+}
+
+#[derive(Debug, Clone)]
+struct LocalBranchTip {
+    name: String,
+    id: Oid,
+}
+
 impl NativeGitRepository {
     fn open(path: &Path) -> Result<Self, RepositoryIngestionError> {
         Ok(Self {
@@ -337,35 +376,284 @@ impl NativeGitRepository {
         })
     }
 
-    fn mainline_commit_ids(
+    fn resolve_mainline(
         &self,
-        mainline: &Mainline,
-    ) -> Result<Vec<Oid>, RepositoryIngestionError> {
+        selection: &MainlineSelection,
+    ) -> Result<Mainline, RepositoryIngestionError> {
+        match selection {
+            MainlineSelection::Explicit(mainline) => {
+                self.mainline_tip(mainline)?;
+                Ok(mainline.clone())
+            }
+            MainlineSelection::DetectFromLocalRefs => self.detect_mainline(),
+        }
+    }
+
+    fn detect_mainline(&self) -> Result<Mainline, RepositoryIngestionError> {
+        for candidate in ["main", "master"] {
+            let mainline = Mainline::new(candidate);
+            if self.mainline_tip(&mainline).is_ok() {
+                return Ok(mainline);
+            }
+        }
+
+        let head = self.repository.head()?;
+        let branch = head.shorthand().ok_or_else(|| {
+            RepositoryIngestionError::new("could not detect Mainline from detached HEAD")
+        })?;
+
+        Ok(Mainline::new(branch))
+    }
+
+    fn mainline_tip(&self, mainline: &Mainline) -> Result<Oid, RepositoryIngestionError> {
         let mainline_ref = format!("refs/heads/{}", mainline.as_str());
-        let mainline_object = self
-            .repository
+        self.repository
             .revparse_single(&mainline_ref)
+            .map(|object| object.id())
             .map_err(|_| {
                 RepositoryIngestionError::new(format!(
                     "requested Mainline '{}' was not found in local repository",
                     mainline.as_str()
                 ))
-            })?;
+            })
+    }
+
+    fn mainline_commit_ids(
+        &self,
+        mainline: &Mainline,
+    ) -> Result<Vec<Oid>, RepositoryIngestionError> {
+        let mainline_tip = self.mainline_tip(mainline)?;
         let mut walk = self.repository.revwalk()?;
         walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
-        walk.push(mainline_object.id())?;
+        walk.push(mainline_tip)?;
 
         let mut commit_ids = walk.collect::<Result<Vec<_>, _>>()?;
         commit_ids.reverse();
         Ok(commit_ids)
     }
 
+    fn commit_plan(
+        &self,
+        mainline: &Mainline,
+    ) -> Result<Vec<PlannedCommit>, RepositoryIngestionError> {
+        let mainline_tip = self.mainline_tip(mainline)?;
+        let mainline_commit_ids = self.mainline_commit_ids(mainline)?;
+        let first_parent_ids = self.first_parent_commit_ids(mainline_tip)?;
+        let branch_tips = self.local_branch_tips_except(mainline)?;
+        let mut branch_flow_by_commit_id = HashMap::new();
+
+        self.add_merge_settlements(
+            mainline,
+            &mainline_commit_ids,
+            &branch_tips,
+            &mut branch_flow_by_commit_id,
+        )?;
+        self.add_unmerged_branch_superpositions(
+            mainline,
+            mainline_tip,
+            &first_parent_ids,
+            &branch_tips,
+            &mut branch_flow_by_commit_id,
+        )?;
+
+        let mut seen_commit_ids = HashSet::new();
+        let mut planned_commits = Vec::new();
+        for commit_id in mainline_commit_ids {
+            seen_commit_ids.insert(commit_id);
+            planned_commits.push(PlannedCommit {
+                id: commit_id,
+                branch_flow: branch_flow_by_commit_id
+                    .remove(&commit_id)
+                    .unwrap_or(BranchFlow::Mainline),
+            });
+        }
+
+        let mut remaining_commit_ids = branch_flow_by_commit_id
+            .keys()
+            .copied()
+            .filter(|commit_id| !seen_commit_ids.contains(commit_id))
+            .collect::<Vec<_>>();
+        remaining_commit_ids.sort_by_key(|commit_id| {
+            self.repository
+                .find_commit(*commit_id)
+                .map(|commit| commit.time().seconds())
+                .unwrap_or_default()
+        });
+
+        for commit_id in remaining_commit_ids {
+            if let Some(branch_flow) = branch_flow_by_commit_id.remove(&commit_id) {
+                planned_commits.push(PlannedCommit {
+                    id: commit_id,
+                    branch_flow,
+                });
+            }
+        }
+
+        Ok(planned_commits)
+    }
+
+    fn first_parent_commit_ids(&self, tip: Oid) -> Result<HashSet<Oid>, RepositoryIngestionError> {
+        let mut commit_ids = HashSet::new();
+        let mut next_commit_id = Some(tip);
+
+        while let Some(commit_id) = next_commit_id {
+            let commit = self.repository.find_commit(commit_id)?;
+            commit_ids.insert(commit_id);
+            next_commit_id = if commit.parent_count() == 0 {
+                None
+            } else {
+                Some(commit.parent_id(0)?)
+            };
+        }
+
+        Ok(commit_ids)
+    }
+
+    fn local_branch_tips_except(
+        &self,
+        mainline: &Mainline,
+    ) -> Result<Vec<LocalBranchTip>, RepositoryIngestionError> {
+        let mut branch_tips = Vec::new();
+        for branch_result in self.repository.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch_result?;
+            let Some(name) = branch.name()?.map(str::to_owned) else {
+                continue;
+            };
+            if name == mainline.as_str() {
+                continue;
+            }
+            let Some(id) = branch.get().target() else {
+                continue;
+            };
+            branch_tips.push(LocalBranchTip { name, id });
+        }
+        branch_tips.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(branch_tips)
+    }
+
+    fn add_merge_settlements(
+        &self,
+        mainline: &Mainline,
+        mainline_commit_ids: &[Oid],
+        branch_tips: &[LocalBranchTip],
+        branch_flow_by_commit_id: &mut HashMap<Oid, BranchFlow>,
+    ) -> Result<(), RepositoryIngestionError> {
+        for commit_id in mainline_commit_ids {
+            let commit = self.repository.find_commit(*commit_id)?;
+            if commit.parent_count() < 2 {
+                continue;
+            }
+
+            let first_parent_id = commit.parent_id(0)?;
+            for parent_index in 1..commit.parent_count() {
+                let side_parent_id = commit.parent_id(parent_index)?;
+                let settled_commit_ids =
+                    self.commits_reachable_from_hiding(side_parent_id, first_parent_id)?;
+                if settled_commit_ids.is_empty() {
+                    continue;
+                }
+
+                let branch = self
+                    .branch_name_for_side_parent(side_parent_id, branch_tips)?
+                    .unwrap_or_else(|| format!("unresolved/{}", short_commit_id(side_parent_id)));
+                let branch_flow = BranchFlow::BranchSuperposition {
+                    branch: branch.clone(),
+                    mainline: mainline.clone(),
+                };
+                for settled_commit_id in &settled_commit_ids {
+                    branch_flow_by_commit_id
+                        .entry(*settled_commit_id)
+                        .or_insert_with(|| branch_flow.clone());
+                }
+                let settlement = MergeSettlement::new(
+                    branch,
+                    mainline.clone(),
+                    settled_commit_ids
+                        .iter()
+                        .map(|commit_id| CommitId::new(commit_id.to_string()))
+                        .collect(),
+                );
+                append_merge_settlement(branch_flow_by_commit_id, *commit_id, settlement);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn add_unmerged_branch_superpositions(
+        &self,
+        mainline: &Mainline,
+        mainline_tip: Oid,
+        first_parent_ids: &HashSet<Oid>,
+        branch_tips: &[LocalBranchTip],
+        branch_flow_by_commit_id: &mut HashMap<Oid, BranchFlow>,
+    ) -> Result<(), RepositoryIngestionError> {
+        for branch_tip in branch_tips {
+            if self
+                .repository
+                .graph_descendant_of(mainline_tip, branch_tip.id)?
+            {
+                continue;
+            }
+
+            let branch_commit_ids =
+                self.commits_reachable_from_hiding(branch_tip.id, mainline_tip)?;
+            let branch_flow = BranchFlow::BranchSuperposition {
+                branch: branch_tip.name.clone(),
+                mainline: mainline.clone(),
+            };
+            for commit_id in branch_commit_ids {
+                if first_parent_ids.contains(&commit_id) {
+                    continue;
+                }
+                branch_flow_by_commit_id
+                    .entry(commit_id)
+                    .or_insert_with(|| branch_flow.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commits_reachable_from_hiding(
+        &self,
+        start: Oid,
+        hide: Oid,
+    ) -> Result<Vec<Oid>, RepositoryIngestionError> {
+        let mut walk = self.repository.revwalk()?;
+        walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
+        walk.push(start)?;
+        walk.hide(hide)?;
+
+        let mut commit_ids = walk.collect::<Result<Vec<_>, _>>()?;
+        commit_ids.reverse();
+        Ok(commit_ids)
+    }
+
+    fn branch_name_for_side_parent(
+        &self,
+        side_parent_id: Oid,
+        branch_tips: &[LocalBranchTip],
+    ) -> Result<Option<String>, RepositoryIngestionError> {
+        for branch_tip in branch_tips {
+            if branch_tip.id == side_parent_id
+                || self
+                    .repository
+                    .graph_descendant_of(branch_tip.id, side_parent_id)?
+            {
+                return Ok(Some(branch_tip.name.clone()));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn commit_event(
         &self,
-        commit_id: Oid,
+        planned_commit: PlannedCommit,
         contributor_normalizer: &mut ContributorNormalizer<'_>,
     ) -> Result<CommitEvent, RepositoryIngestionError> {
-        let commit = self.repository.find_commit(commit_id)?;
+        let commit = self.repository.find_commit(planned_commit.id)?;
         let parent_ids = commit
             .parents()
             .map(|parent| CommitId::new(parent.id().to_string()))
@@ -383,6 +671,7 @@ impl NativeGitRepository {
             contributor,
         )
         .with_parent_ids(parent_ids)
+        .with_branch_flow(planned_commit.branch_flow)
         .with_file_changes(file_changes);
 
         Ok(CommitEvent::from_evidence(evidence))
@@ -410,6 +699,24 @@ impl NativeGitRepository {
         diff.find_similar(Some(&mut find_options))?;
 
         diff.deltas().map(file_change_from_delta).collect()
+    }
+}
+
+fn short_commit_id(commit_id: Oid) -> String {
+    commit_id.to_string().chars().take(12).collect()
+}
+
+fn append_merge_settlement(
+    branch_flow_by_commit_id: &mut HashMap<Oid, BranchFlow>,
+    commit_id: Oid,
+    settlement: MergeSettlement,
+) {
+    match branch_flow_by_commit_id.get_mut(&commit_id) {
+        Some(BranchFlow::MergeSettlements(settlements)) => settlements.push(settlement),
+        _ => {
+            branch_flow_by_commit_id
+                .insert(commit_id, BranchFlow::MergeSettlements(vec![settlement]));
+        }
     }
 }
 
@@ -520,7 +827,7 @@ fn file_change_from_delta(
 mod tests {
     use super::{ingest_repository, scaffold_repository_replay, RepositoryIngestionRequest};
     use super::{AutomationContributorRule, ContributorNormalizationRules};
-    use gitflux_scene::{ContributorKind, FileChangeKind, Mainline};
+    use gitflux_scene::{BranchFlow, CommitId, ContributorKind, FileChangeKind, Mainline};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -530,9 +837,25 @@ mod tests {
     fn scaffold_uses_requested_mainline() {
         let request = RepositoryIngestionRequest::new(".", Mainline::new("trunk"));
 
-        let summary = scaffold_repository_replay(&request);
+        let summary =
+            scaffold_repository_replay(&request).expect("explicit Mainline can scaffold replay");
 
         assert_eq!(summary.replay().mainline().as_str(), "trunk");
+    }
+
+    #[test]
+    fn detected_mainline_request_does_not_expose_auto_sentinel() {
+        let request = RepositoryIngestionRequest::detect_mainline(".");
+
+        let error = scaffold_repository_replay(&request)
+            .expect_err("detected Mainline needs repository resolution");
+
+        assert_eq!(request.explicit_mainline(), None);
+        assert!(!error.to_string().contains("auto"));
+        assert_eq!(
+            error.to_string(),
+            "Mainline must be explicit before scaffolding Repository Replay"
+        );
     }
 
     #[test]
@@ -634,6 +957,202 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "requested Mainline 'release' was not found in local repository"
+        );
+    }
+
+    #[test]
+    fn detects_mainline_from_local_refs_and_keeps_explicit_override() {
+        let fixture = GeneratedGitRepository::new_on_branch("trunk");
+        fixture.write_file("README.md", "Gitflux\n");
+        fixture.commit("Add readme", "Ada Lovelace", "ada@example.test");
+        fixture.create_branch("main");
+        fixture.create_branch("release");
+
+        let detected_request = RepositoryIngestionRequest::detect_mainline(fixture.path());
+        let detected_summary =
+            ingest_repository(&detected_request).expect("local main ref should be detected");
+
+        assert_eq!(detected_summary.replay().mainline().as_str(), "main");
+
+        let override_request =
+            RepositoryIngestionRequest::new(fixture.path(), Mainline::new("release"));
+        let override_summary =
+            ingest_repository(&override_request).expect("explicit Mainline should win");
+
+        assert_eq!(override_summary.replay().mainline().as_str(), "release");
+    }
+
+    #[test]
+    fn represents_unmerged_branch_work_as_branch_superposition() {
+        let fixture = GeneratedGitRepository::new();
+        fixture.write_file("README.md", "Gitflux\n");
+        fixture.commit("Add readme", "Ada Lovelace", "ada@example.test");
+        fixture.create_and_checkout_branch("feature/search");
+        fixture.write_file("src/search.rs", "pub fn search() {}\n");
+        let branch_commit = fixture.commit("Add search", "Grace Hopper", "grace@example.test");
+        fixture.checkout_branch("main");
+
+        let request = RepositoryIngestionRequest::detect_mainline(fixture.path());
+
+        let summary = ingest_repository(&request).expect("fixture repository should ingest");
+        let branch_event = summary
+            .replay()
+            .commit_events()
+            .iter()
+            .find(|event| event.id().as_str() == branch_commit)
+            .expect("unmerged branch Commit Event should be present");
+
+        assert_eq!(
+            branch_event.branch_flow(),
+            &BranchFlow::BranchSuperposition {
+                branch: "feature/search".to_owned(),
+                mainline: Mainline::new("main")
+            }
+        );
+        assert_eq!(branch_event.file_changes().len(), 1);
+        assert_eq!(
+            branch_event.file_changes()[0].entity().path(),
+            Path::new("src/search.rs")
+        );
+    }
+
+    #[test]
+    fn marks_metadata_only_merge_commit_as_merge_settlement_without_file_changes() {
+        let fixture = GeneratedGitRepository::new();
+        fixture.write_file("README.md", "Gitflux\n");
+        fixture.commit("Add readme", "Ada Lovelace", "ada@example.test");
+        fixture.create_and_checkout_branch("feature/search");
+        let branch_commit =
+            fixture.empty_commit("Record search branch", "Grace Hopper", "grace@example.test");
+        fixture.checkout_branch("main");
+        fixture.merge_no_ff("feature/search", "Merge search");
+        let merge_commit = fixture.git(["rev-parse", "HEAD"]).trim().to_owned();
+
+        let request = RepositoryIngestionRequest::detect_mainline(fixture.path());
+
+        let summary = ingest_repository(&request).expect("fixture repository should ingest");
+        let events = summary.replay().commit_events();
+        let branch_event = events
+            .iter()
+            .find(|event| event.id().as_str() == branch_commit)
+            .expect("merged branch Commit Event should be present");
+        let settlement_event = events
+            .iter()
+            .find(|event| event.id().as_str() == merge_commit)
+            .expect("merge Commit Event should be present");
+
+        assert_eq!(
+            branch_event.branch_flow(),
+            &BranchFlow::BranchSuperposition {
+                branch: "feature/search".to_owned(),
+                mainline: Mainline::new("main")
+            }
+        );
+        assert_eq!(
+            settlement_event.branch_flow(),
+            &BranchFlow::MergeSettlements(vec![gitflux_scene::MergeSettlement::new(
+                "feature/search",
+                Mainline::new("main"),
+                vec![CommitId::new(branch_commit)]
+            )])
+        );
+        assert!(
+            settlement_event.file_changes().is_empty(),
+            "metadata-only Merge Settlement should not duplicate File Changes"
+        );
+    }
+
+    #[test]
+    fn keeps_file_changes_on_merge_settlement_with_manual_resolution() {
+        let fixture = GeneratedGitRepository::new();
+        fixture.write_file("README.md", "Gitflux\n");
+        fixture.commit("Add readme", "Ada Lovelace", "ada@example.test");
+        fixture.create_and_checkout_branch("feature/search");
+        fixture.write_file("README.md", "Gitflux\nSearch branch\n");
+        let branch_commit = fixture.commit("Add search note", "Grace Hopper", "grace@example.test");
+        fixture.checkout_branch("main");
+        fixture.write_file("README.md", "Gitflux\nMainline note\n");
+        fixture.commit("Add mainline note", "Ada Lovelace", "ada@example.test");
+        fixture.merge_no_commit("feature/search");
+        fixture.write_file(
+            "README.md",
+            "Gitflux\nMainline note\nSearch branch\nResolved\n",
+        );
+        let merge_commit = fixture.commit(
+            "Merge search with resolution",
+            "Merge Bot",
+            "merge@example.test",
+        );
+
+        let request = RepositoryIngestionRequest::detect_mainline(fixture.path());
+
+        let summary = ingest_repository(&request).expect("fixture repository should ingest");
+        let settlement_event = summary
+            .replay()
+            .commit_events()
+            .iter()
+            .find(|event| event.id().as_str() == merge_commit)
+            .expect("merge Commit Event should be present");
+
+        assert_eq!(
+            settlement_event.branch_flow(),
+            &BranchFlow::MergeSettlements(vec![gitflux_scene::MergeSettlement::new(
+                "feature/search",
+                Mainline::new("main"),
+                vec![CommitId::new(branch_commit)]
+            )])
+        );
+        assert_eq!(settlement_event.file_changes().len(), 1);
+        assert_eq!(
+            settlement_event.file_changes()[0].entity().path(),
+            Path::new("README.md")
+        );
+        assert_eq!(
+            *settlement_event.file_changes()[0].kind(),
+            FileChangeKind::Modified
+        );
+    }
+
+    #[test]
+    fn preserves_all_settlements_on_octopus_merge() {
+        let fixture = GeneratedGitRepository::new();
+        fixture.write_file("README.md", "Gitflux\n");
+        fixture.commit("Add readme", "Ada Lovelace", "ada@example.test");
+        fixture.create_and_checkout_branch("feature/search");
+        fixture.write_file("src/search.rs", "pub fn search() {}\n");
+        let search_commit = fixture.commit("Add search", "Grace Hopper", "grace@example.test");
+        fixture.checkout_branch("main");
+        fixture.create_and_checkout_branch("feature/export");
+        fixture.write_file("src/export.rs", "pub fn export() {}\n");
+        let export_commit = fixture.commit("Add export", "Alan Turing", "alan@example.test");
+        fixture.checkout_branch("main");
+        fixture.merge_octopus(["feature/search", "feature/export"], "Merge features");
+        let merge_commit = fixture.git(["rev-parse", "HEAD"]).trim().to_owned();
+
+        let request = RepositoryIngestionRequest::detect_mainline(fixture.path());
+
+        let summary = ingest_repository(&request).expect("fixture repository should ingest");
+        let settlement_event = summary
+            .replay()
+            .commit_events()
+            .iter()
+            .find(|event| event.id().as_str() == merge_commit)
+            .expect("octopus merge Commit Event should be present");
+
+        assert_eq!(
+            settlement_event.branch_flow(),
+            &BranchFlow::MergeSettlements(vec![
+                gitflux_scene::MergeSettlement::new(
+                    "feature/search",
+                    Mainline::new("main"),
+                    vec![CommitId::new(search_commit)]
+                ),
+                gitflux_scene::MergeSettlement::new(
+                    "feature/export",
+                    Mainline::new("main"),
+                    vec![CommitId::new(export_commit)]
+                )
+            ])
         );
     }
 
@@ -802,9 +1321,13 @@ mod tests {
 
     impl GeneratedGitRepository {
         fn new() -> Self {
+            Self::new_on_branch("main")
+        }
+
+        fn new_on_branch(initial_branch: &str) -> Self {
             let temp_dir = tempfile::tempdir().expect("fixture tempdir should be created");
             let fixture = Self { temp_dir };
-            fixture.git(["init", "--initial-branch=main"]);
+            fixture.git(["init", "--initial-branch", initial_branch]);
             fixture
         }
 
@@ -829,6 +1352,49 @@ mod tests {
 
         fn remove_file(&self, path: &str) {
             self.git(["rm", path]);
+        }
+
+        fn create_branch(&self, branch: &str) {
+            self.git(["branch", branch]);
+        }
+
+        fn create_and_checkout_branch(&self, branch: &str) {
+            self.git(["checkout", "-b", branch]);
+        }
+
+        fn checkout_branch(&self, branch: &str) {
+            self.git(["checkout", branch]);
+        }
+
+        fn merge_no_ff(&self, branch: &str, subject: &str) {
+            self.git_with_identity(
+                ["merge", "--no-ff", branch, "-m", subject],
+                "Merge Bot",
+                "merge@example.test",
+            );
+        }
+
+        fn merge_no_commit(&self, branch: &str) {
+            let output = self.run_git_allow_failure(
+                ["merge", "--no-ff", "--no-commit", branch],
+                Some(GitIdentity {
+                    author_name: "Merge Bot",
+                    author_email: "merge@example.test",
+                    committer_name: "Merge Bot",
+                    committer_email: "merge@example.test",
+                }),
+            );
+            assert!(
+                !output.status.success(),
+                "fixture merge should stop for manual resolution"
+            );
+        }
+
+        fn merge_octopus<const N: usize>(&self, branches: [&str; N], subject: &str) {
+            let mut args = vec!["merge", "--no-ff"];
+            args.extend(branches);
+            args.extend(["-m", subject]);
+            self.git_vec_with_identity(args, "Merge Bot", "merge@example.test");
         }
 
         fn commit(&self, subject: &str, name: &str, email: &str) -> String {
@@ -856,6 +1422,11 @@ mod tests {
             self.git(["rev-parse", "HEAD"]).trim().to_owned()
         }
 
+        fn empty_commit(&self, subject: &str, name: &str, email: &str) -> String {
+            self.git_with_identity(["commit", "--allow-empty", "-m", subject], name, email);
+            self.git(["rev-parse", "HEAD"]).trim().to_owned()
+        }
+
         fn git<const N: usize>(&self, args: [&str; N]) -> String {
             self.run_git(args, None)
         }
@@ -877,14 +1448,30 @@ mod tests {
             )
         }
 
+        fn git_vec_with_identity(&self, args: Vec<&str>, name: &str, email: &str) -> String {
+            self.run_git_vec(
+                args,
+                Some(GitIdentity {
+                    author_name: name,
+                    author_email: email,
+                    committer_name: name,
+                    committer_email: email,
+                }),
+            )
+        }
+
         fn run_git<const N: usize>(
             &self,
             args: [&str; N],
             identity: Option<GitIdentity<'_>>,
         ) -> String {
+            self.run_git_vec(args.to_vec(), identity)
+        }
+
+        fn run_git_vec(&self, args: Vec<&str>, identity: Option<GitIdentity<'_>>) -> String {
             let mut command = Command::new("git");
             command
-                .args(args)
+                .args(&args)
                 .current_dir(self.path())
                 .env("GIT_AUTHOR_DATE", "2024-01-02T03:04:05Z")
                 .env("GIT_COMMITTER_DATE", "2024-01-02T03:04:05Z");
@@ -906,6 +1493,29 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             String::from_utf8(output.stdout).expect("git fixture output should be utf-8")
+        }
+
+        fn run_git_allow_failure<const N: usize>(
+            &self,
+            args: [&str; N],
+            identity: Option<GitIdentity<'_>>,
+        ) -> std::process::Output {
+            let mut command = Command::new("git");
+            command
+                .args(args)
+                .current_dir(self.path())
+                .env("GIT_AUTHOR_DATE", "2024-01-02T03:04:05Z")
+                .env("GIT_COMMITTER_DATE", "2024-01-02T03:04:05Z");
+
+            if let Some(identity) = identity {
+                command
+                    .env("GIT_AUTHOR_NAME", identity.author_name)
+                    .env("GIT_AUTHOR_EMAIL", identity.author_email)
+                    .env("GIT_COMMITTER_NAME", identity.committer_name)
+                    .env("GIT_COMMITTER_EMAIL", identity.committer_email);
+            }
+
+            command.output().expect("git fixture command should run")
         }
     }
 

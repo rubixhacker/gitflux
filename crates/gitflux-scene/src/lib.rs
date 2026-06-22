@@ -67,6 +67,7 @@ impl Mainline {
 pub struct CommitEvent {
     id: CommitId,
     parent_ids: Vec<CommitId>,
+    branch_flow: BranchFlow,
     subject: CommitSubject,
     authored_at: GitTimestamp,
     committed_at: GitTimestamp,
@@ -81,6 +82,7 @@ pub struct CommitEvent {
 pub struct CommitEvidence {
     id: CommitId,
     parent_ids: Vec<CommitId>,
+    branch_flow: BranchFlow,
     subject: CommitSubject,
     authored_at: GitTimestamp,
     committed_at: GitTimestamp,
@@ -105,6 +107,7 @@ impl CommitEvidence {
         Self {
             id,
             parent_ids: Vec::new(),
+            branch_flow: BranchFlow::Mainline,
             subject,
             authored_at,
             committed_at,
@@ -119,6 +122,13 @@ impl CommitEvidence {
     #[must_use]
     pub fn with_parent_ids(mut self, parent_ids: Vec<CommitId>) -> Self {
         self.parent_ids = parent_ids;
+        self
+    }
+
+    /// Sets the branch-flow state for this Commit Event.
+    #[must_use]
+    pub fn with_branch_flow(mut self, branch_flow: BranchFlow) -> Self {
+        self.branch_flow = branch_flow;
         self
     }
 
@@ -137,6 +147,7 @@ impl CommitEvent {
         Self {
             id,
             parent_ids: Vec::new(),
+            branch_flow: BranchFlow::Mainline,
             subject: CommitSubject::new(""),
             authored_at: GitTimestamp::new(0, 0),
             committed_at: GitTimestamp::new(0, 0),
@@ -161,6 +172,7 @@ impl CommitEvent {
         Self {
             id: evidence.id,
             parent_ids: evidence.parent_ids,
+            branch_flow: evidence.branch_flow,
             subject: evidence.subject,
             authored_at: evidence.authored_at,
             committed_at: evidence.committed_at,
@@ -181,6 +193,12 @@ impl CommitEvent {
     #[must_use]
     pub fn parent_ids(&self) -> &[CommitId] {
         &self.parent_ids
+    }
+
+    /// Returns the branch-flow state for this Commit Event.
+    #[must_use]
+    pub fn branch_flow(&self) -> &BranchFlow {
+        &self.branch_flow
     }
 
     /// Returns the commit subject.
@@ -223,6 +241,64 @@ impl CommitEvent {
     #[must_use]
     pub fn file_changes(&self) -> &[FileChange] {
         &self.file_changes
+    }
+}
+
+/// Branch-flow classification for a Commit Event in Repository Replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchFlow {
+    /// The Commit Event is on the selected Mainline.
+    Mainline,
+    /// The Commit Event is provisional work from a branch relative to the Mainline.
+    BranchSuperposition {
+        /// Local branch name carrying the provisional work.
+        branch: String,
+        /// Mainline the branch is provisional against.
+        mainline: Mainline,
+    },
+    /// One or more branch settlements attached to a merge Commit Event.
+    MergeSettlements(Vec<MergeSettlement>),
+}
+
+/// Branch work settled into the Mainline by a merge Commit Event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeSettlement {
+    branch: String,
+    mainline: Mainline,
+    settled_commit_ids: Vec<CommitId>,
+}
+
+impl MergeSettlement {
+    /// Creates Merge Settlement evidence.
+    #[must_use]
+    pub fn new(
+        branch: impl Into<String>,
+        mainline: Mainline,
+        settled_commit_ids: Vec<CommitId>,
+    ) -> Self {
+        Self {
+            branch: branch.into(),
+            mainline,
+            settled_commit_ids,
+        }
+    }
+
+    /// Returns the local branch whose provisional work is settled.
+    #[must_use]
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Returns the Mainline receiving the settled work.
+    #[must_use]
+    pub fn mainline(&self) -> &Mainline {
+        &self.mainline
+    }
+
+    /// Returns the Commit Events settled by this merge.
+    #[must_use]
+    pub fn settled_commit_ids(&self) -> &[CommitId] {
+        &self.settled_commit_ids
     }
 }
 
@@ -1218,7 +1294,7 @@ pub struct ConfigValueError;
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitEvent, CommitId, Contributor, FileChange, FileChangeKind, Mainline,
+        BranchFlow, CommitEvent, CommitId, Contributor, FileChange, FileChangeKind, Mainline,
         RenderConfiguration, RepositoryEntity, RepositoryReplay,
     };
 
@@ -1236,6 +1312,10 @@ mod tests {
 
         assert_eq!(replay.mainline().as_str(), "main");
         assert_eq!(replay.commit_events()[0].id().as_str(), "abc123");
+        assert_eq!(
+            replay.commit_events()[0].branch_flow(),
+            &BranchFlow::Mainline
+        );
     }
 
     #[test]

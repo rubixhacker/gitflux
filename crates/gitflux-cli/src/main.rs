@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use gitflux_scene::{Layout, RenderConfiguration};
+use gitflux_scene::{Layout, Mainline, RenderConfiguration};
 
 const HELP: &str = "\
 Gitflux command-line interface
@@ -75,6 +75,7 @@ fn run_render(args: impl IntoIterator<Item = String>) -> Result<String, String> 
         "Output target: {}\n",
         config.output_path.display()
     ));
+    output.push_str(&format!("Mainline: {}\n", config.mainline.as_str()));
     output.push_str(&format!(
         "Render Configuration: {}\n",
         config.render_configuration_label()
@@ -96,6 +97,7 @@ fn render_json_progress(config: &RenderCommand) -> String {
             "phase": phase,
             "phase_index": index,
             "phase_count": RENDER_PHASES.len(),
+            "mainline": config.mainline.as_str(),
             "render_configuration": config.render_configuration_label(),
         });
         output.push_str(&event.to_string());
@@ -113,6 +115,7 @@ fn parse_render_args(args: impl IntoIterator<Item = String>) -> Result<RenderCom
         .ok_or_else(|| format!("missing repository path\n\n{HELP}"))?;
     let mut output_path = None;
     let mut config_path = None;
+    let mut mainline = Mainline::new("auto");
     let mut json = false;
 
     while let Some(arg) = args.next() {
@@ -128,6 +131,12 @@ fn parse_render_args(args: impl IntoIterator<Item = String>) -> Result<RenderCom
                 if config_path.is_none() {
                     return Err("missing render configuration path after --config".to_owned());
                 }
+            }
+            "--mainline" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing Mainline name after --mainline".to_owned())?;
+                mainline = Mainline::new(value);
             }
             "--json" => json = true,
             flag => return Err(format!("unrecognized render option: {flag}")),
@@ -157,6 +166,7 @@ fn parse_render_args(args: impl IntoIterator<Item = String>) -> Result<RenderCom
         repository_path,
         output_path,
         config_path,
+        mainline,
         render_configuration,
         json,
     })
@@ -186,6 +196,7 @@ struct RenderCommand {
     repository_path: PathBuf,
     output_path: PathBuf,
     config_path: Option<PathBuf>,
+    mainline: Mainline,
     render_configuration: RenderConfiguration,
     json: bool,
 }
@@ -261,6 +272,21 @@ mod tests {
         assert!(output.contains("Render"));
         assert!(output.contains("Video Export"));
         assert!(output.contains("Export Manifest"));
+    }
+
+    #[test]
+    fn render_reports_cli_mainline_override() {
+        let output = run([
+            "render".to_owned(),
+            ".".to_owned(),
+            "--output".to_owned(),
+            "out.mp4".to_owned(),
+            "--mainline".to_owned(),
+            "release".to_owned(),
+        ])
+        .expect("render tracer should accept explicit Mainline");
+
+        assert!(output.contains("Mainline: release"));
     }
 
     #[test]
