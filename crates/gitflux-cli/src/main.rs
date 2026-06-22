@@ -11,11 +11,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use gitflux_export::{
-    export_video, ExportManifest, FfmpegBinary, VideoExportOptions, VideoExportRequest,
+    export_video_with_manifest_context, ExportManifest, ExportManifestContext,
+    ExportOutputSettings, ExportPacing, ExportProgressEvent, ExportProgressPhase,
+    ExportRepositoryIdentity, ExportSelectedRefState, FfmpegBinary, VideoExportOptions,
+    VideoExportRequest,
 };
 use gitflux_ingestion::{ingest_repository, RepositoryIngestionRequest};
 use gitflux_render::{FrameCount, RenderPlan};
-use gitflux_scene::{Layout, Mainline, RenderConfiguration};
+use gitflux_scene::{Layout, Mainline, RenderConfiguration, ReplayPacingDuration};
+use sha2::{Digest, Sha256};
 
 const HELP: &str = "\
 Gitflux command-line interface
@@ -29,15 +33,6 @@ Options:
   -V, --version    Print version
   --ffmpeg-path    Use a specific FFmpeg binary for Video Export
 ";
-
-const RENDER_PHASES: &[&str] = &[
-    "Repository Ingestion",
-    "Repository Replay",
-    "Render Configuration",
-    "Render",
-    "Video Export",
-    "Export Manifest",
-];
 
 fn main() -> ExitCode {
     let args = env::args().skip(1);
@@ -78,10 +73,19 @@ fn run_render(args: impl IntoIterator<Item = String>) -> Result<String, String> 
 
 fn execute_render(config: &RenderCommand) -> Result<RenderExecution, String> {
     let ingestion_request = config.ingestion_request();
-    let replay = ingest_repository(&ingestion_request)
-        .map_err(|error| format!("failed to ingest repository: {error}"))?
-        .replay()
-        .clone();
+    let ingestion_summary = ingest_repository(&ingestion_request)
+        .map_err(|error| format!("failed to ingest repository: {error}"))?;
+    let replay = ingestion_summary.replay().clone();
+    let mut progress_events = vec![ExportProgressEvent::new(ExportProgressPhase::Ingestion)
+        .with_detail(
+            "repository_path",
+            config.repository_path.display().to_string(),
+        )
+        .with_detail("mainline", replay.mainline().as_str())];
+    progress_events.push(
+        ExportProgressEvent::new(ExportProgressPhase::SceneConstruction)
+            .with_detail("commit_events", replay.commit_events().len().to_string()),
+    );
     let export_request = VideoExportRequest::try_new(
         RenderPlan::new(replay, config.render_configuration.clone()),
         &config.output_path,
@@ -91,10 +95,23 @@ fn execute_render(config: &RenderCommand) -> Result<RenderExecution, String> {
         config.ffmpeg_binary.clone(),
         FrameCount::new(NonZeroU64::new(1).expect("one frame is non-zero")),
     );
-    let export_manifest =
-        export_video(&export_request, &export_options).map_err(|error| error.to_string())?;
+    let manifest_context = config
+        .manifest_context(&export_request)?
+        .with_progress_events(progress_events.clone());
+    let mut export_progress = Vec::new();
+    let export_manifest = export_video_with_manifest_context(
+        &export_request,
+        &export_options,
+        manifest_context,
+        |event| export_progress.push(event),
+    )
+    .map_err(|error| error.to_string())?;
+    progress_events.extend(export_progress);
 
-    Ok(RenderExecution { export_manifest })
+    Ok(RenderExecution {
+        export_manifest,
+        progress_events,
+    })
 }
 
 fn render_human_summary(config: &RenderCommand, execution: &RenderExecution) -> String {
@@ -122,27 +139,20 @@ fn render_human_summary(config: &RenderCommand, execution: &RenderExecution) -> 
         config.render_configuration_label()
     ));
 
-    for phase in RENDER_PHASES {
-        output.push_str(&format!("- {phase}\n"));
+    for event in &execution.progress_events {
+        output.push_str(&format!("- {}\n", render_phase_label(event.phase())));
     }
 
     output
 }
 
-fn render_json_progress(config: &RenderCommand, execution: &RenderExecution) -> String {
+fn render_json_progress(_config: &RenderCommand, execution: &RenderExecution) -> String {
     let mut output = String::new();
 
-    for (index, phase) in RENDER_PHASES.iter().enumerate() {
-        let event = serde_json::json!({
-            "event": "render_progress",
-            "phase": phase,
-            "phase_index": index,
-            "phase_count": RENDER_PHASES.len(),
-            "mainline": config.mainline.as_label(),
-            "render_configuration": config.render_configuration_label(),
-            "output_path": execution.export_manifest.output_path(),
-        });
-        output.push_str(&event.to_string());
+    for event in &execution.progress_events {
+        output.push_str(
+            &serde_json::to_string(event).expect("ExportProgressEvent should serialize to JSON"),
+        );
         output.push('\n');
     }
 
@@ -254,6 +264,7 @@ struct RenderCommand {
 
 struct RenderExecution {
     export_manifest: ExportManifest,
+    progress_events: Vec<ExportProgressEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +278,13 @@ impl MainlineSelection {
         match self {
             Self::Detect => "auto",
             Self::Explicit(mainline) => mainline.as_str(),
+        }
+    }
+
+    fn selection_mode(&self) -> &str {
+        match self {
+            Self::Detect => "detected",
+            Self::Explicit(_) => "explicit",
         }
     }
 }
@@ -307,14 +325,95 @@ impl RenderCommand {
             layout_name
         )
     }
+
+    fn manifest_context(
+        &self,
+        export_request: &VideoExportRequest,
+    ) -> Result<ExportManifestContext, String> {
+        let repository = git2::Repository::open(&self.repository_path).map_err(|error| {
+            format!(
+                "failed to inspect repository identity {}: {error}",
+                self.repository_path.display()
+            )
+        })?;
+        let selected_mainline = export_request.render_plan().replay().mainline().as_str();
+        let mainline_ref = format!("refs/heads/{selected_mainline}");
+        let mainline_tip = repository
+            .revparse_single(&mainline_ref)
+            .ok()
+            .map(|object| object.id().to_string());
+        let remote_url = repository
+            .find_remote("origin")
+            .ok()
+            .and_then(|remote| remote.url().map(ToOwned::to_owned));
+        let frame_size = self.render_configuration.frame_size();
+
+        Ok(ExportManifestContext::new(
+            ExportRepositoryIdentity::new(self.repository_path.display().to_string(), remote_url),
+            ExportSelectedRefState::new(
+                self.mainline.selection_mode(),
+                selected_mainline,
+                mainline_tip,
+            ),
+            self.config_hash(),
+            self.export_pacing(),
+            ExportOutputSettings::new(
+                export_request.output_path(),
+                export_request.output_preset(),
+                frame_size.width(),
+                frame_size.height(),
+                self.render_configuration.frames_per_second().get(),
+            ),
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
+    fn config_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        if let Some(config_path) = &self.config_path {
+            if let Ok(contents) = fs::read(config_path) {
+                hasher.update(contents);
+            }
+        } else {
+            hasher.update(b"default:");
+            hasher.update(self.render_configuration_label().as_bytes());
+        }
+
+        format!("sha256:{:x}", hasher.finalize())
+    }
+
+    fn export_pacing(&self) -> ExportPacing {
+        let pacing = self.render_configuration.replay_pacing();
+        let duration = match pacing.duration() {
+            ReplayPacingDuration::Auto => "auto".to_owned(),
+            ReplayPacingDuration::Target { duration_seconds } => {
+                format!("target:{duration_seconds}s")
+            }
+        };
+
+        ExportPacing::new("adaptive", duration)
+    }
+}
+
+fn render_phase_label(phase: ExportProgressPhase) -> &'static str {
+    match phase {
+        ExportProgressPhase::Ingestion => "Repository Ingestion",
+        ExportProgressPhase::SceneConstruction => "Scene Construction",
+        ExportProgressPhase::FrameRendering => "Frame Rendering",
+        ExportProgressPhase::FfmpegEncoding => "FFmpeg Encoding",
+        ExportProgressPhase::ManifestWriting => "Export Manifest",
+        ExportProgressPhase::Warnings => "Warnings",
+        ExportProgressPhase::Completion => "Completion",
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{parse_render_args, run};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn prints_help_by_default() {
@@ -353,11 +452,12 @@ mod tests {
         .expect("render should export");
 
         assert!(output.contains("Repository Ingestion"));
-        assert!(output.contains("Repository Replay"));
-        assert!(output.contains("Render Configuration"));
-        assert!(output.contains("Render"));
-        assert!(output.contains("Video Export"));
+        assert!(output.contains("Scene Construction"));
+        assert!(output.contains("Frame Rendering"));
+        assert!(output.contains("FFmpeg Encoding"));
         assert!(output.contains("Export Manifest"));
+        assert!(output.contains("Warnings"));
+        assert!(output.contains("Completion"));
     }
 
     #[test]
@@ -414,11 +514,12 @@ mod tests {
     fn render_json_reports_structured_progress_events() {
         let fixture = CliGitFixture::new("json");
         let ffmpeg = write_fake_ffmpeg("json");
+        let output_path = fixture.path().join("out.mp4");
         let output = run([
             "render".to_owned(),
             fixture.path().display().to_string(),
             "--output".to_owned(),
-            fixture.path().join("out.mp4").display().to_string(),
+            output_path.display().to_string(),
             "--ffmpeg-path".to_owned(),
             ffmpeg.display().to_string(),
             "--json".to_owned(),
@@ -438,18 +539,130 @@ mod tests {
         assert_eq!(
             phases,
             [
-                "Repository Ingestion",
-                "Repository Replay",
-                "Render Configuration",
-                "Render",
-                "Video Export",
-                "Export Manifest"
+                "ingestion",
+                "scene_construction",
+                "frame_rendering",
+                "ffmpeg_encoding",
+                "manifest_writing",
+                "warnings",
+                "completion"
             ]
         );
         assert!(events
             .iter()
             .all(|event| event["event"].as_str() == Some("render_progress")));
-        assert!(fixture.path().join("out.mp4").exists());
+        assert!(events
+            .iter()
+            .all(|event| event["timestamp_unix_ms"].as_u64().is_some()));
+        assert!(output_path.exists());
+        let manifest_path = output_path.with_file_name("out.mp4.gitflux-manifest.json");
+        assert!(manifest_path.exists());
+        let completion_timestamp = events
+            .iter()
+            .find(|event| event["phase"].as_str() == Some("completion"))
+            .and_then(|event| event["timestamp_unix_ms"].as_u64())
+            .expect("completion timestamp should be present");
+        let manifest_modified_timestamp = manifest_path
+            .metadata()
+            .expect("manifest metadata should be readable")
+            .modified()
+            .expect("manifest modified time should be readable")
+            .duration_since(UNIX_EPOCH)
+            .expect("manifest modified time should be after Unix epoch")
+            .as_millis() as u64;
+        assert!(completion_timestamp >= manifest_modified_timestamp);
+    }
+
+    #[test]
+    fn render_writes_export_manifest_sidecar() {
+        let fixture = CliGitFixture::new("manifest");
+        let ffmpeg = write_fake_ffmpeg("manifest");
+        let output_path = fixture.path().join("out.mp4");
+
+        run([
+            "render".to_owned(),
+            fixture.path().display().to_string(),
+            "--output".to_owned(),
+            output_path.display().to_string(),
+            "--ffmpeg-path".to_owned(),
+            ffmpeg.display().to_string(),
+            "--mainline".to_owned(),
+            "main".to_owned(),
+            "--json".to_owned(),
+        ])
+        .expect("render should export and write manifest");
+
+        let manifest_path = output_path.with_file_name("out.mp4.gitflux-manifest.json");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("manifest sidecar should be readable"),
+        )
+        .expect("manifest should be JSON");
+
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(
+            manifest["repository"]["path"].as_str(),
+            Some(
+                fixture
+                    .path()
+                    .to_str()
+                    .expect("fixture path should be utf8")
+            )
+        );
+        assert_eq!(
+            manifest["selected_ref"]["selection_mode"].as_str(),
+            Some("explicit")
+        );
+        assert_eq!(manifest["selected_ref"]["mainline"].as_str(), Some("main"));
+        assert!(manifest["selected_ref"]["mainline_tip"]
+            .as_str()
+            .is_some_and(|tip| tip.len() == 40));
+        assert!(manifest["config_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:")));
+        assert_eq!(manifest["pacing"]["mode"].as_str(), Some("adaptive"));
+        assert_eq!(
+            manifest["output_settings"]["path"].as_str(),
+            Some(output_path.to_str().expect("output path should be utf8"))
+        );
+        assert_eq!(manifest["output_settings"]["preset"].as_str(), Some("mp4"));
+        assert_eq!(
+            manifest["output_settings"]["frame_width"].as_u64(),
+            Some(1920)
+        );
+        assert_eq!(
+            manifest["output_settings"]["frame_height"].as_u64(),
+            Some(1080)
+        );
+        assert_eq!(
+            manifest["output_settings"]["frames_per_second"].as_u64(),
+            Some(60)
+        );
+        assert_eq!(
+            manifest["gitflux_version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(manifest["ffmpeg"]["preset"].as_str(), Some("mp4"));
+        assert!(manifest["ffmpeg"]["command"]
+            .as_array()
+            .expect("ffmpeg command should be an array")
+            .iter()
+            .any(|value| value.as_str() == Some("-framerate")));
+
+        let timestamp_phases = manifest["event_timestamps"]
+            .as_array()
+            .expect("event timestamp mapping should be an array")
+            .iter()
+            .map(|event| event["phase"].as_str().expect("phase should be a string"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            timestamp_phases,
+            [
+                "ingestion",
+                "scene_construction",
+                "frame_rendering",
+                "ffmpeg_encoding"
+            ]
+        );
     }
 
     #[test]
@@ -530,6 +743,48 @@ settle_iterations = 80
         assert!(output.contains("1280x720"));
         assert!(output.contains("30 FPS"));
         assert!(output.contains("Repository Graph"));
+    }
+
+    #[test]
+    fn identical_config_contents_have_stable_hash_across_paths() {
+        let fixture = CliGitFixture::new("config-hash");
+        let contents = r##"
+frame_width = 1280
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "terminal"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+"##;
+        let first_config = write_temp_render_config("same-config-a", contents);
+        let second_config = write_temp_render_config("same-config-b", contents);
+
+        let first_command = parse_render_args([
+            fixture.path().display().to_string(),
+            "--output".to_owned(),
+            fixture.path().join("first.mp4").display().to_string(),
+            "--config".to_owned(),
+            first_config.display().to_string(),
+        ])
+        .expect("first config should parse");
+        let second_command = parse_render_args([
+            fixture.path().display().to_string(),
+            "--output".to_owned(),
+            fixture.path().join("second.mp4").display().to_string(),
+            "--config".to_owned(),
+            second_config.display().to_string(),
+        ])
+        .expect("second config should parse");
+
+        assert_eq!(first_command.config_hash(), second_command.config_hash());
     }
 
     #[test]

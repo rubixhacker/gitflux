@@ -5,16 +5,22 @@
 //! embedding media codec support in the core Repository Replay pipeline.
 
 use std::{
+    collections::BTreeMap,
     fmt::{Display, Formatter},
+    fs,
     num::NonZeroU64,
     path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use gitflux_render::{
     FrameCount, FrameFileStem, FrameSequenceOutput, OffscreenRenderer, RenderError, RenderPlan,
     RendererSettings,
 };
+use serde::{Deserialize, Serialize};
+
+const MANIFEST_SUFFIX: &str = "gitflux-manifest.json";
 
 /// Request to produce a Video Export from a render plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,18 +69,67 @@ impl VideoExportRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportManifest {
     output_path: PathBuf,
+    manifest_path: PathBuf,
     encoder: VideoEncoder,
     output_preset: OutputPreset,
+    repository: ExportRepositoryIdentity,
+    selected_ref: ExportSelectedRefState,
+    config_hash: String,
+    pacing: ExportPacing,
+    output_settings: ExportOutputSettings,
+    gitflux_version: String,
+    ffmpeg: ExportFfmpegPlan,
+    event_timestamps: Vec<ExportEventTimestamp>,
 }
 
 impl ExportManifest {
     /// Creates an Export Manifest from a validated Video Export request.
     #[must_use]
     pub fn from_request(request: &VideoExportRequest, encoder: VideoEncoder) -> Self {
+        Self::from_request_context(
+            request,
+            encoder,
+            ExportManifestContext::from_request(request, env!("CARGO_PKG_VERSION")),
+            FfmpegCommandPlan::for_png_sequence(
+                FfmpegBinary::default(),
+                request,
+                "frames/frame_%06d.png",
+                request
+                    .render_plan()
+                    .configuration()
+                    .frames_per_second()
+                    .get(),
+                0,
+            ),
+            Vec::new(),
+        )
+    }
+
+    /// Creates an Export Manifest from request, context, command plan, and progress events.
+    #[must_use]
+    pub fn from_request_context(
+        request: &VideoExportRequest,
+        encoder: VideoEncoder,
+        context: ExportManifestContext,
+        command_plan: FfmpegCommandPlan,
+        progress_events: Vec<ExportProgressEvent>,
+    ) -> Self {
         Self {
             output_path: request.output_path().to_path_buf(),
+            manifest_path: default_manifest_path(request.output_path()),
             encoder,
             output_preset: request.output_preset(),
+            repository: context.repository,
+            selected_ref: context.selected_ref,
+            config_hash: context.config_hash,
+            pacing: context.pacing,
+            output_settings: context.output_settings,
+            gitflux_version: context.gitflux_version,
+            ffmpeg: ExportFfmpegPlan::from_command_plan(request.output_preset(), &command_plan),
+            event_timestamps: progress_events
+                .into_iter()
+                .map(ExportEventTimestamp::from_progress_event)
+                .collect(),
         }
     }
 
@@ -82,6 +137,12 @@ impl ExportManifest {
     #[must_use]
     pub fn output_path(&self) -> &Path {
         &self.output_path
+    }
+
+    /// Returns the sidecar manifest path.
+    #[must_use]
+    pub fn manifest_path(&self) -> &Path {
+        &self.manifest_path
     }
 
     /// Returns the encoder delegated to by Video Export.
@@ -95,17 +156,413 @@ impl ExportManifest {
     pub fn output_preset(&self) -> OutputPreset {
         self.output_preset
     }
+
+    /// Returns repository identity metadata.
+    #[must_use]
+    pub fn repository(&self) -> &ExportRepositoryIdentity {
+        &self.repository
+    }
+
+    /// Returns selected Mainline/ref metadata.
+    #[must_use]
+    pub fn selected_ref(&self) -> &ExportSelectedRefState {
+        &self.selected_ref
+    }
+
+    /// Returns the render configuration hash.
+    #[must_use]
+    pub fn config_hash(&self) -> &str {
+        &self.config_hash
+    }
+
+    /// Returns the replay pacing manifest record.
+    #[must_use]
+    pub fn pacing(&self) -> &ExportPacing {
+        &self.pacing
+    }
+
+    /// Returns output settings metadata.
+    #[must_use]
+    pub fn output_settings(&self) -> &ExportOutputSettings {
+        &self.output_settings
+    }
+
+    /// Returns the Gitflux version that produced the export.
+    #[must_use]
+    pub fn gitflux_version(&self) -> &str {
+        &self.gitflux_version
+    }
+
+    /// Returns FFmpeg command metadata.
+    #[must_use]
+    pub fn ffmpeg(&self) -> &ExportFfmpegPlan {
+        &self.ffmpeg
+    }
+
+    /// Returns progress event timestamps captured during export.
+    #[must_use]
+    pub fn event_timestamps(&self) -> &[ExportEventTimestamp] {
+        &self.event_timestamps
+    }
+
+    fn to_sidecar(&self) -> ExportManifestSidecar {
+        ExportManifestSidecar {
+            schema_version: 1,
+            repository: self.repository.clone(),
+            selected_ref: self.selected_ref.clone(),
+            config_hash: self.config_hash.clone(),
+            pacing: self.pacing.clone(),
+            output_settings: self.output_settings.clone(),
+            gitflux_version: self.gitflux_version.clone(),
+            ffmpeg: self.ffmpeg.clone(),
+            event_timestamps: self.event_timestamps.clone(),
+        }
+    }
+}
+
+/// Serializable sidecar shape written next to exported media.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportManifestSidecar {
+    /// Manifest schema version.
+    pub schema_version: u32,
+    /// Repository identity.
+    pub repository: ExportRepositoryIdentity,
+    /// Selected Mainline/ref state.
+    pub selected_ref: ExportSelectedRefState,
+    /// Hash of the Render Configuration input.
+    pub config_hash: String,
+    /// Replay pacing mode and duration policy.
+    pub pacing: ExportPacing,
+    /// Output path, container preset, frame size, and frame rate.
+    pub output_settings: ExportOutputSettings,
+    /// Gitflux package version.
+    pub gitflux_version: String,
+    /// FFmpeg preset and command details.
+    pub ffmpeg: ExportFfmpegPlan,
+    /// Timestamp mapping for progress events emitted during export.
+    pub event_timestamps: Vec<ExportEventTimestamp>,
+}
+
+/// Context supplied by callers that know repository/configuration identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportManifestContext {
+    repository: ExportRepositoryIdentity,
+    selected_ref: ExportSelectedRefState,
+    config_hash: String,
+    pacing: ExportPacing,
+    output_settings: ExportOutputSettings,
+    gitflux_version: String,
+    progress_events: Vec<ExportProgressEvent>,
+}
+
+impl ExportManifestContext {
+    /// Creates a manifest context.
+    #[must_use]
+    pub fn new(
+        repository: ExportRepositoryIdentity,
+        selected_ref: ExportSelectedRefState,
+        config_hash: impl Into<String>,
+        pacing: ExportPacing,
+        output_settings: ExportOutputSettings,
+        gitflux_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            repository,
+            selected_ref,
+            config_hash: config_hash.into(),
+            pacing,
+            output_settings,
+            gitflux_version: gitflux_version.into(),
+            progress_events: Vec::new(),
+        }
+    }
+
+    /// Includes progress events captured before the export crate took over.
+    #[must_use]
+    pub fn with_progress_events(mut self, progress_events: Vec<ExportProgressEvent>) -> Self {
+        self.progress_events = progress_events;
+        self
+    }
+
+    /// Builds a conservative context when callers only have an export request.
+    #[must_use]
+    pub fn from_request(request: &VideoExportRequest, gitflux_version: impl Into<String>) -> Self {
+        let configuration = request.render_plan().configuration();
+        let frame_size = configuration.frame_size();
+
+        Self::new(
+            ExportRepositoryIdentity::new("", None),
+            ExportSelectedRefState::new(
+                "unspecified",
+                request.render_plan().replay().mainline().as_str(),
+                None,
+            ),
+            "unspecified",
+            ExportPacing::new("adaptive", "auto"),
+            ExportOutputSettings::new(
+                request.output_path(),
+                request.output_preset(),
+                frame_size.width(),
+                frame_size.height(),
+                configuration.frames_per_second().get(),
+            ),
+            gitflux_version,
+        )
+    }
+}
+
+/// Repository identity captured in an export manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRepositoryIdentity {
+    path: String,
+    remote_url: Option<String>,
+}
+
+impl ExportRepositoryIdentity {
+    /// Creates repository identity metadata.
+    #[must_use]
+    pub fn new(path: impl Into<String>, remote_url: Option<String>) -> Self {
+        Self {
+            path: path.into(),
+            remote_url,
+        }
+    }
+
+    /// Returns the repository path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the remote URL, if discovered.
+    #[must_use]
+    pub fn remote_url(&self) -> Option<&str> {
+        self.remote_url.as_deref()
+    }
+}
+
+/// Selected Mainline/ref state captured in an export manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportSelectedRefState {
+    selection_mode: String,
+    mainline: String,
+    mainline_tip: Option<String>,
+}
+
+impl ExportSelectedRefState {
+    /// Creates selected ref-state metadata.
+    #[must_use]
+    pub fn new(
+        selection_mode: impl Into<String>,
+        mainline: impl Into<String>,
+        mainline_tip: Option<String>,
+    ) -> Self {
+        Self {
+            selection_mode: selection_mode.into(),
+            mainline: mainline.into(),
+            mainline_tip,
+        }
+    }
+
+    /// Returns whether Mainline was detected or explicitly selected.
+    #[must_use]
+    pub fn selection_mode(&self) -> &str {
+        &self.selection_mode
+    }
+
+    /// Returns the selected Mainline name.
+    #[must_use]
+    pub fn mainline(&self) -> &str {
+        &self.mainline
+    }
+
+    /// Returns the selected Mainline tip OID, if discovered.
+    #[must_use]
+    pub fn mainline_tip(&self) -> Option<&str> {
+        self.mainline_tip.as_deref()
+    }
+}
+
+/// Replay pacing metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportPacing {
+    mode: String,
+    duration: String,
+}
+
+impl ExportPacing {
+    /// Creates replay pacing metadata.
+    #[must_use]
+    pub fn new(mode: impl Into<String>, duration: impl Into<String>) -> Self {
+        Self {
+            mode: mode.into(),
+            duration: duration.into(),
+        }
+    }
+
+    /// Returns the pacing mode.
+    #[must_use]
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+}
+
+/// Output settings metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportOutputSettings {
+    path: String,
+    preset: OutputPreset,
+    frame_width: u32,
+    frame_height: u32,
+    frames_per_second: u32,
+}
+
+impl ExportOutputSettings {
+    /// Creates output settings metadata.
+    #[must_use]
+    pub fn new(
+        path: impl AsRef<Path>,
+        preset: OutputPreset,
+        frame_width: u32,
+        frame_height: u32,
+        frames_per_second: u32,
+    ) -> Self {
+        Self {
+            path: path.as_ref().display().to_string(),
+            preset,
+            frame_width,
+            frame_height,
+            frames_per_second,
+        }
+    }
+
+    /// Returns the output media path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+/// FFmpeg command metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportFfmpegPlan {
+    preset: OutputPreset,
+    program: String,
+    arguments: Vec<String>,
+    command: Vec<String>,
+}
+
+impl ExportFfmpegPlan {
+    fn from_command_plan(preset: OutputPreset, command_plan: &FfmpegCommandPlan) -> Self {
+        let program = command_plan.program().display().to_string();
+        let arguments = command_plan.arguments().to_vec();
+        let mut command = Vec::with_capacity(arguments.len() + 1);
+        command.push(program.clone());
+        command.extend(arguments.clone());
+
+        Self {
+            preset,
+            program,
+            arguments,
+            command,
+        }
+    }
+
+    /// Returns the complete FFmpeg command vector.
+    #[must_use]
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+}
+
+/// Timestamp captured for a progress event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportEventTimestamp {
+    phase: ExportProgressPhase,
+    timestamp_unix_ms: u128,
+}
+
+impl ExportEventTimestamp {
+    fn from_progress_event(event: ExportProgressEvent) -> Self {
+        Self {
+            phase: event.phase,
+            timestamp_unix_ms: event.timestamp_unix_ms,
+        }
+    }
+
+    /// Returns the event phase.
+    #[must_use]
+    pub fn phase(&self) -> ExportProgressPhase {
+        self.phase
+    }
+}
+
+/// Ordered progress event emitted by export and CLI orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportProgressEvent {
+    event: &'static str,
+    phase: ExportProgressPhase,
+    timestamp_unix_ms: u128,
+    details: BTreeMap<String, String>,
+}
+
+impl ExportProgressEvent {
+    /// Creates a progress event for a phase.
+    #[must_use]
+    pub fn new(phase: ExportProgressPhase) -> Self {
+        Self {
+            event: "render_progress",
+            phase,
+            timestamp_unix_ms: timestamp_unix_ms(),
+            details: BTreeMap::new(),
+        }
+    }
+
+    /// Adds string details to a progress event.
+    #[must_use]
+    pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.details.insert(key.into(), value.into());
+        self
+    }
+
+    /// Returns the progress phase.
+    #[must_use]
+    pub fn phase(&self) -> ExportProgressPhase {
+        self.phase
+    }
+}
+
+/// Progress phases reported during render/export orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportProgressPhase {
+    /// Repository ingestion has completed.
+    Ingestion,
+    /// Scene construction/render plan has completed.
+    SceneConstruction,
+    /// Deterministic frame rendering has completed.
+    FrameRendering,
+    /// FFmpeg encoding has completed.
+    FfmpegEncoding,
+    /// Export manifest sidecar has been written.
+    ManifestWriting,
+    /// Non-fatal warnings were emitted.
+    Warnings,
+    /// Export completed.
+    Completion,
 }
 
 /// External encoder used for Video Export.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoEncoder {
     /// An installed FFmpeg binary.
     Ffmpeg,
 }
 
 /// Container and codec preset for a Video Export.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputPreset {
     /// MP4 container encoded through H.264 for broad compatibility.
     Mp4,
@@ -366,6 +823,13 @@ pub enum ExportError {
     },
     /// Deterministic frame rendering failed.
     Render(RenderError),
+    /// Export manifest sidecar could not be written.
+    ManifestWrite {
+        /// Manifest sidecar path.
+        manifest_path: PathBuf,
+        /// Filesystem or serialization error.
+        source: std::io::Error,
+    },
 }
 
 impl Display for ExportError {
@@ -414,6 +878,14 @@ impl Display for ExportError {
                 output_path.display()
             ),
             Self::Render(error) => write!(formatter, "could not render export frames: {error}"),
+            Self::ManifestWrite {
+                manifest_path,
+                source,
+            } => write!(
+                formatter,
+                "could not write export manifest '{}': {source}",
+                manifest_path.display()
+            ),
         }
     }
 }
@@ -424,6 +896,7 @@ impl std::error::Error for ExportError {
             Self::FfmpegNotFound { source, .. } => Some(source),
             Self::OutputNotCreated { source, .. } => Some(source),
             Self::Render(error) => Some(error),
+            Self::ManifestWrite { source, .. } => Some(source),
             Self::UnsupportedOutputPreset { .. }
             | Self::FfmpegFailed { .. }
             | Self::OutputEmpty { .. } => None,
@@ -441,6 +914,21 @@ pub fn scaffold_export_manifest(request: &VideoExportRequest) -> ExportManifest 
 pub fn export_video(
     request: &VideoExportRequest,
     options: &VideoExportOptions,
+) -> Result<ExportManifest, ExportError> {
+    export_video_with_manifest_context(
+        request,
+        options,
+        ExportManifestContext::from_request(request, env!("CARGO_PKG_VERSION")),
+        |_| {},
+    )
+}
+
+/// Renders deterministic frames, encodes them with FFmpeg, and writes an Export Manifest sidecar.
+pub fn export_video_with_manifest_context(
+    request: &VideoExportRequest,
+    options: &VideoExportOptions,
+    context: ExportManifestContext,
+    mut on_progress: impl FnMut(ExportProgressEvent),
 ) -> Result<ExportManifest, ExportError> {
     let frame_output = FrameSequenceOutput::new(
         options.work_directory.join("frames"),
@@ -460,19 +948,71 @@ pub fn export_video(
 
     command_plan.validate_binary()?;
 
+    let mut progress_events = Vec::new();
     let export_result = (|| {
         let renderer =
             OffscreenRenderer::new(options.renderer_settings).map_err(ExportError::Render)?;
         renderer
             .render_frame_sequence(request.render_plan(), &frame_output, options.frame_count())
             .map_err(ExportError::Render)?;
+        record_progress(
+            &mut progress_events,
+            &mut on_progress,
+            ExportProgressEvent::new(ExportProgressPhase::FrameRendering)
+                .with_detail("frame_count", options.frame_count().get().to_string()),
+        );
         command_plan.run()?;
+        record_progress(
+            &mut progress_events,
+            &mut on_progress,
+            ExportProgressEvent::new(ExportProgressPhase::FfmpegEncoding)
+                .with_detail("output_path", request.output_path().display().to_string()),
+        );
         verify_output_file(request.output_path())
     })();
     let _ = std::fs::remove_dir_all(&options.work_directory);
     export_result?;
 
-    Ok(ExportManifest::from_request(request, VideoEncoder::Ffmpeg))
+    let mut manifest_events = context.progress_events.clone();
+    manifest_events.extend(progress_events.clone());
+    let manifest = ExportManifest::from_request_context(
+        request,
+        VideoEncoder::Ffmpeg,
+        context,
+        command_plan,
+        manifest_events,
+    );
+    write_manifest_sidecar(&manifest)?;
+
+    let manifest_written_event = ExportProgressEvent::new(ExportProgressPhase::ManifestWriting)
+        .with_detail(
+            "manifest_path",
+            default_manifest_path(request.output_path())
+                .display()
+                .to_string(),
+        );
+    let warnings_event =
+        ExportProgressEvent::new(ExportProgressPhase::Warnings).with_detail("count", "0");
+    let completion_event = ExportProgressEvent::new(ExportProgressPhase::Completion)
+        .with_detail("output_path", request.output_path().display().to_string());
+    record_progress(
+        &mut progress_events,
+        &mut on_progress,
+        manifest_written_event,
+    );
+    record_progress(&mut progress_events, &mut on_progress, warnings_event);
+    record_progress(&mut progress_events, &mut on_progress, completion_event);
+
+    Ok(manifest)
+}
+
+fn record_progress(
+    progress_events: &mut Vec<ExportProgressEvent>,
+    on_progress: &mut impl FnMut(ExportProgressEvent),
+    event: ExportProgressEvent,
+) {
+    on_progress(event.clone());
+    progress_events.push(event);
 }
 
 fn ffmpeg_input_pattern(frame_output: &FrameSequenceOutput) -> String {
@@ -499,6 +1039,34 @@ fn verify_output_file(output_path: &Path) -> Result<(), ExportError> {
     Ok(())
 }
 
+fn write_manifest_sidecar(manifest: &ExportManifest) -> Result<(), ExportError> {
+    let contents = serde_json::to_vec_pretty(&manifest.to_sidecar()).map_err(|source| {
+        ExportError::ManifestWrite {
+            manifest_path: manifest.manifest_path().to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        }
+    })?;
+    fs::write(manifest.manifest_path(), contents).map_err(|source| ExportError::ManifestWrite {
+        manifest_path: manifest.manifest_path().to_path_buf(),
+        source,
+    })
+}
+
+fn default_manifest_path(output_path: &Path) -> PathBuf {
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export");
+    output_path.with_file_name(format!("{file_name}.{MANIFEST_SUFFIX}"))
+}
+
+fn timestamp_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
 fn default_work_directory() -> PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -511,10 +1079,14 @@ fn default_work_directory() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        scaffold_export_manifest, verify_output_file, FfmpegBinary, FfmpegCommandPlan,
-        OutputPreset, VideoEncoder, VideoExportRequest,
+        export_video_with_manifest_context, scaffold_export_manifest, verify_output_file,
+        ExportManifestContext, ExportOutputSettings, ExportPacing, ExportProgressPhase,
+        ExportRepositoryIdentity, ExportSelectedRefState, FfmpegBinary, FfmpegCommandPlan,
+        OutputPreset, VideoEncoder, VideoExportOptions, VideoExportRequest,
     };
-    use gitflux_render::RenderPlan;
+    use std::num::NonZeroU64;
+
+    use gitflux_render::{FrameCount, RenderPlan};
     use gitflux_scene::{
         Layout, Mainline, RenderConfiguration, RepositoryReplay, Theme, VisualMetaphor,
     };
@@ -710,6 +1282,65 @@ mod tests {
 
         assert!(message.contains("exit code: 42"));
         assert!(message.contains("broken ffmpeg"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn manifest_write_failure_does_not_report_terminal_progress() {
+        let temp_dir = unique_temp_dir("manifest-write-failure");
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let fake_ffmpeg = temp_dir.join("ffmpeg");
+        write_executable_script(
+            &fake_ffmpeg,
+            "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then exit 0; fi\nfor output_path do :; done\nprintf 'video\\n' > \"$output_path\"\n",
+        );
+        let output_path = temp_dir.join("gitflux.mp4");
+        let manifest_path = temp_dir.join("gitflux.mp4.gitflux-manifest.json");
+        std::fs::create_dir_all(&manifest_path).expect("manifest path conflict should be created");
+        let request = VideoExportRequest::try_new(render_plan(), &output_path)
+            .expect("supported Video Export request");
+        let options = VideoExportOptions::new(
+            FfmpegBinary::from_path(&fake_ffmpeg),
+            FrameCount::new(NonZeroU64::new(1).expect("one is non-zero")),
+        )
+        .with_work_directory(temp_dir.join("work"));
+        let frame_size = request.render_plan().configuration().frame_size();
+        let context = ExportManifestContext::new(
+            ExportRepositoryIdentity::new(temp_dir.display().to_string(), None),
+            ExportSelectedRefState::new("explicit", "main", None),
+            "sha256:test",
+            ExportPacing::new("adaptive", "auto"),
+            ExportOutputSettings::new(
+                request.output_path(),
+                request.output_preset(),
+                frame_size.width(),
+                frame_size.height(),
+                request
+                    .render_plan()
+                    .configuration()
+                    .frames_per_second()
+                    .get(),
+            ),
+            "test",
+        );
+        let mut progress = Vec::new();
+
+        let error = export_video_with_manifest_context(&request, &options, context, |event| {
+            progress.push(event);
+        })
+        .expect_err("manifest path conflict should fail the export");
+        let phases = progress
+            .iter()
+            .map(|event| event.phase())
+            .collect::<Vec<_>>();
+
+        assert!(error
+            .to_string()
+            .contains("could not write export manifest"));
+        assert!(!phases.contains(&ExportProgressPhase::ManifestWriting));
+        assert!(!phases.contains(&ExportProgressPhase::Warnings));
+        assert!(!phases.contains(&ExportProgressPhase::Completion));
+        assert!(manifest_path.is_dir());
     }
 
     fn render_plan() -> RenderPlan {
