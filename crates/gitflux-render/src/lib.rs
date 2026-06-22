@@ -15,8 +15,8 @@ use std::{
 
 use bytemuck::{Pod, Zeroable};
 use gitflux_scene::{
-    RenderConfiguration, RepositoryGraphScene, RepositoryReplay, SceneEmphasis, ScenePosition,
-    Theme,
+    DirectorySceneId, RenderConfiguration, RepositoryGraphScene, RepositoryReplay, SceneEmphasis,
+    SceneLabelKind, SceneLabelTarget, SceneLabelTiming, ScenePosition, Theme,
 };
 
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -379,7 +379,14 @@ impl OffscreenRenderer {
         let frame_size =
             RenderFrameSize::new(scene.frame_size().width(), scene.frame_size().height());
         let batches = RenderBatches::from_scene(&scene, plan.configuration().theme(), frame_index);
-        let rgba = self.render_batches(frame_size, plan.configuration().theme(), &batches)?;
+        let mut rgba = self.render_batches(frame_size, plan.configuration().theme(), &batches)?;
+        apply_readability_overlay(
+            &mut rgba,
+            frame_size,
+            &scene,
+            plan.configuration().theme(),
+            frame_index,
+        );
 
         Ok(RenderedFrame {
             index: frame_index,
@@ -911,16 +918,22 @@ impl SceneTransform {
     }
 
     fn to_pixels(self, position: ScenePosition) -> (f32, f32) {
-        let pixel_x = self.offset_x + (position.x() as f32 - self.min_x) * self.scale;
-        let pixel_y = self.offset_y + (position.y() as f32 - self.min_y) * self.scale;
+        let frame_point = self.to_frame_pixels(position);
         (
-            (pixel_x / self.width) * 2.0 - 1.0,
-            1.0 - (pixel_y / self.height) * 2.0,
+            (frame_point.x / self.width) * 2.0 - 1.0,
+            1.0 - (frame_point.y / self.height) * 2.0,
         )
     }
 
     fn size_to_clip_space(self, width: f32, height: f32) -> ClipSize {
         ClipSize::new((width / self.width) * 2.0, (height / self.height) * 2.0)
+    }
+
+    fn to_frame_pixels(self, position: ScenePosition) -> FramePoint {
+        FramePoint::new(
+            self.offset_x + (position.x() as f32 - self.min_x) * self.scale,
+            self.offset_y + (position.y() as f32 - self.min_y) * self.scale,
+        )
     }
 }
 
@@ -972,6 +985,828 @@ fn active_file_ids(scene: &RepositoryGraphScene, frame_index: FrameIndex) -> BTr
                 .then(|| file_change.file_id().as_str().to_owned())
         })
         .collect()
+}
+
+fn apply_readability_overlay(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    scene: &RepositoryGraphScene,
+    theme: &Theme,
+    frame_index: FrameIndex,
+) {
+    if frame_size.width() < 320 || frame_size.height() < 180 {
+        return;
+    }
+
+    let palette = OverlayPalette::from_theme(theme);
+    let transform = SceneTransform::from_scene(scene);
+
+    draw_graph_context(pixels, frame_size, scene, transform, palette);
+    draw_title_and_progress(pixels, frame_size, scene, frame_index, palette);
+    draw_legend(pixels, frame_size, palette);
+    draw_scene_labels(pixels, frame_size, scene, transform, palette);
+    draw_current_activity_caption(pixels, frame_size, scene, frame_index, palette);
+}
+
+fn draw_graph_context(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    scene: &RepositoryGraphScene,
+    transform: SceneTransform,
+    palette: OverlayPalette,
+) {
+    let directory_positions: BTreeMap<DirectorySceneId, FramePoint> = scene
+        .directories()
+        .iter()
+        .map(|directory| {
+            (
+                directory.id().clone(),
+                transform.to_frame_pixels(directory.position()),
+            )
+        })
+        .collect();
+
+    for file in scene.files() {
+        let Some(parent_id) = file.parent_directory_id() else {
+            continue;
+        };
+        let Some(parent_position) = directory_positions.get(parent_id) else {
+            continue;
+        };
+        let file_position = transform.to_frame_pixels(file.position());
+        draw_line(
+            pixels,
+            frame_size,
+            *parent_position,
+            file_position,
+            palette.structure_line,
+        );
+    }
+
+    if let Some(first_directory) = scene.directories().first() {
+        let point = transform.to_frame_pixels(first_directory.position());
+        draw_text(
+            pixels,
+            frame_size,
+            "DIRECTORIES",
+            32,
+            (point.y - 28.0).round() as i32,
+            2,
+            palette.muted_text,
+        );
+    }
+    if let Some(first_file) = scene.files().first() {
+        let point = transform.to_frame_pixels(first_file.position());
+        draw_text(
+            pixels,
+            frame_size,
+            "FILES / CHANGES",
+            32,
+            (point.y - 26.0).round() as i32,
+            2,
+            palette.muted_text,
+        );
+    }
+}
+
+fn draw_title_and_progress(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    scene: &RepositoryGraphScene,
+    frame_index: FrameIndex,
+    palette: OverlayPalette,
+) {
+    draw_rect(
+        pixels,
+        frame_size,
+        24,
+        22,
+        frame_size.width() as i32 - 48,
+        74,
+        palette.panel,
+    );
+    draw_text(
+        pixels,
+        frame_size,
+        "GITFLUX",
+        44,
+        38,
+        3,
+        palette.primary_text,
+    );
+    draw_text(
+        pixels,
+        frame_size,
+        "REPOSITORY HISTORY REPLAY",
+        44,
+        68,
+        2,
+        palette.secondary_text,
+    );
+
+    let progress_left = 420;
+    let progress_top = 50;
+    let progress_width = frame_size.width() as i32 - progress_left - 48;
+    let progress_height = 8;
+    draw_rect(
+        pixels,
+        frame_size,
+        progress_left,
+        progress_top,
+        progress_width,
+        progress_height,
+        palette.rail,
+    );
+    let progress = replay_progress(scene, frame_index);
+    draw_rect(
+        pixels,
+        frame_size,
+        progress_left,
+        progress_top,
+        ((progress_width as f32) * progress).round() as i32,
+        progress_height,
+        palette.accent,
+    );
+
+    let (activity_index, activity_total) = current_activity_ordinal(scene, frame_index);
+    let progress_text = format!(
+        "FRAME {:03}   COMMIT {:02}/{:02}",
+        frame_index.get(),
+        activity_index,
+        activity_total
+    );
+    draw_text(
+        pixels,
+        frame_size,
+        &progress_text,
+        progress_left,
+        progress_top + 20,
+        1,
+        palette.secondary_text,
+    );
+}
+
+fn draw_legend(pixels: &mut [u8], frame_size: RenderFrameSize, palette: OverlayPalette) {
+    let x = frame_size.width() as i32 - 260;
+    let y = 118;
+    draw_rect(pixels, frame_size, x, y, 220, 110, palette.panel);
+    draw_text(
+        pixels,
+        frame_size,
+        "LEGEND",
+        x + 18,
+        y + 16,
+        2,
+        palette.primary_text,
+    );
+    draw_legend_item(
+        pixels,
+        frame_size,
+        x + 20,
+        y + 44,
+        palette.contributor,
+        "CONTRIBUTOR",
+        palette,
+    );
+    draw_legend_item(
+        pixels,
+        frame_size,
+        x + 20,
+        y + 64,
+        palette.entity,
+        "REPOSITORY ENTITY",
+        palette,
+    );
+    draw_legend_item(
+        pixels,
+        frame_size,
+        x + 20,
+        y + 84,
+        palette.activity,
+        "ACTIVE CHANGE",
+        palette,
+    );
+}
+
+fn draw_legend_item(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    x: i32,
+    y: i32,
+    swatch: OverlayColor,
+    text: &str,
+    palette: OverlayPalette,
+) {
+    draw_rect(pixels, frame_size, x, y + 2, 12, 12, swatch);
+    draw_text(
+        pixels,
+        frame_size,
+        text,
+        x + 22,
+        y,
+        1,
+        palette.secondary_text,
+    );
+}
+
+fn draw_scene_labels(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    scene: &RepositoryGraphScene,
+    transform: SceneTransform,
+    palette: OverlayPalette,
+) {
+    let contributor_positions: BTreeMap<String, FramePoint> = scene
+        .contributors()
+        .iter()
+        .map(|contributor| {
+            (
+                contributor.id().as_str().to_owned(),
+                transform.to_frame_pixels(contributor.position()),
+            )
+        })
+        .collect();
+    let directory_positions: BTreeMap<String, FramePoint> = scene
+        .directories()
+        .iter()
+        .map(|directory| {
+            (
+                directory.id().as_str().to_owned(),
+                transform.to_frame_pixels(directory.position()),
+            )
+        })
+        .collect();
+    let summary_positions: BTreeMap<String, FramePoint> = scene
+        .visual_summaries()
+        .iter()
+        .map(|summary| {
+            (
+                summary.id().as_str().to_owned(),
+                transform.to_frame_pixels(summary.position()),
+            )
+        })
+        .collect();
+
+    for label in scene.labels() {
+        match label.target() {
+            SceneLabelTarget::Contributor(contributor_id)
+                if label.kind() == SceneLabelKind::ContributorName =>
+            {
+                if let Some(point) = contributor_positions.get(contributor_id.as_str()) {
+                    draw_anchor_label(
+                        pixels,
+                        frame_size,
+                        *point,
+                        &shorten_text(label.text(), 20),
+                        LabelPlacement::Above,
+                        palette,
+                    );
+                }
+            }
+            SceneLabelTarget::Directory(directory_id)
+                if label.kind() == SceneLabelKind::DirectoryPath =>
+            {
+                if let Some(point) = directory_positions.get(directory_id.as_str()) {
+                    draw_anchor_label(
+                        pixels,
+                        frame_size,
+                        *point,
+                        &shorten_text(label.text(), 18),
+                        LabelPlacement::Below,
+                        palette,
+                    );
+                }
+            }
+            SceneLabelTarget::VisualSummary(summary_id)
+                if label.kind() == SceneLabelKind::SummaryPath =>
+            {
+                if let Some(point) = summary_positions.get(summary_id.as_str()) {
+                    draw_anchor_label(
+                        pixels,
+                        frame_size,
+                        *point,
+                        &shorten_text(label.text(), 20),
+                        LabelPlacement::Below,
+                        palette,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if scene.labels().iter().all(|label| {
+        !matches!(
+            label.kind(),
+            SceneLabelKind::DirectoryPath | SceneLabelKind::SummaryPath
+        )
+    }) {
+        for directory in scene.directories().iter().take(6) {
+            let point = transform.to_frame_pixels(directory.position());
+            draw_anchor_label(
+                pixels,
+                frame_size,
+                point,
+                &shorten_text(directory.path(), 18),
+                LabelPlacement::Below,
+                palette,
+            );
+        }
+    }
+}
+
+fn draw_anchor_label(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    point: FramePoint,
+    text: &str,
+    placement: LabelPlacement,
+    palette: OverlayPalette,
+) {
+    let text_width = text_pixel_width(text, 1);
+    let x = (point.x.round() as i32 - text_width / 2)
+        .clamp(28, frame_size.width() as i32 - text_width - 28);
+    let y = match placement {
+        LabelPlacement::Above => point.y.round() as i32 - 28,
+        LabelPlacement::Below => point.y.round() as i32 + 16,
+    };
+    draw_rect(
+        pixels,
+        frame_size,
+        x - 6,
+        y - 5,
+        text_width + 12,
+        17,
+        palette.label_backing,
+    );
+    draw_text(pixels, frame_size, text, x, y, 1, palette.primary_text);
+}
+
+fn draw_current_activity_caption(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    scene: &RepositoryGraphScene,
+    frame_index: FrameIndex,
+    palette: OverlayPalette,
+) {
+    let subject = active_label_text(scene, frame_index, SceneLabelKind::CurrentCommitSubject)
+        .unwrap_or_else(|| "REPLAYING REPOSITORY CHANGE".to_owned());
+    let date = active_label_text(scene, frame_index, SceneLabelKind::ReplayDate)
+        .unwrap_or_else(|| "REPLAY".to_owned());
+    let (activity_index, activity_total) = current_activity_ordinal(scene, frame_index);
+    let x = 32;
+    let y = frame_size.height() as i32 - 104;
+    let width = frame_size.width() as i32 - 64;
+
+    draw_rect(pixels, frame_size, x, y, width, 74, palette.panel_strong);
+    draw_text(
+        pixels,
+        frame_size,
+        &format!(
+            "NOW  {}  COMMIT {:02}/{:02}",
+            date, activity_index, activity_total
+        ),
+        x + 20,
+        y + 16,
+        2,
+        palette.accent,
+    );
+    draw_text(
+        pixels,
+        frame_size,
+        &shorten_text(&subject, 72),
+        x + 20,
+        y + 44,
+        2,
+        palette.primary_text,
+    );
+}
+
+fn active_label_text(
+    scene: &RepositoryGraphScene,
+    frame_index: FrameIndex,
+    kind: SceneLabelKind,
+) -> Option<String> {
+    scene
+        .labels()
+        .iter()
+        .filter(|label| label.kind() == kind && timing_contains(label.timing(), frame_index))
+        .map(|label| label.text().to_owned())
+        .next()
+}
+
+fn timing_contains(timing: SceneLabelTiming, frame_index: FrameIndex) -> bool {
+    match timing {
+        SceneLabelTiming::Persistent => true,
+        SceneLabelTiming::ActivityFrameWindow {
+            start_frame,
+            end_frame,
+        }
+        | SceneLabelTiming::FadeFrameRange {
+            start_frame,
+            end_frame,
+        } => (start_frame..=end_frame).contains(&frame_index.get()),
+    }
+}
+
+fn replay_progress(scene: &RepositoryGraphScene, frame_index: FrameIndex) -> f32 {
+    let final_frame = scene
+        .activities()
+        .iter()
+        .flat_map(|activity| {
+            activity
+                .file_changes()
+                .iter()
+                .map(|file_change| activity.playback_frame() + file_change.playback_frame_offset())
+        })
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    ((frame_index.get() as f32) / (final_frame as f32)).clamp(0.0, 1.0)
+}
+
+fn current_activity_ordinal(
+    scene: &RepositoryGraphScene,
+    frame_index: FrameIndex,
+) -> (usize, usize) {
+    let total = scene.activities().len().max(1);
+    let index = scene
+        .activities()
+        .iter()
+        .take_while(|activity| activity.playback_frame() <= frame_index.get())
+        .count()
+        .clamp(1, total);
+    (index, total)
+}
+
+fn shorten_text(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (count, character) in text.chars().enumerate() {
+        if count >= max_chars {
+            output.push_str("...");
+            return output;
+        }
+        output.push(character.to_ascii_uppercase());
+    }
+    output
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelPlacement {
+    Above,
+    Below,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FramePoint {
+    x: f32,
+    y: f32,
+}
+
+impl FramePoint {
+    fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayColor {
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+}
+
+impl OverlayColor {
+    const fn rgba(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            alpha,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayPalette {
+    primary_text: OverlayColor,
+    secondary_text: OverlayColor,
+    muted_text: OverlayColor,
+    panel: OverlayColor,
+    panel_strong: OverlayColor,
+    label_backing: OverlayColor,
+    rail: OverlayColor,
+    structure_line: OverlayColor,
+    accent: OverlayColor,
+    contributor: OverlayColor,
+    entity: OverlayColor,
+    activity: OverlayColor,
+}
+
+impl OverlayPalette {
+    fn from_theme(theme: &Theme) -> Self {
+        let entity = color_u8_from_hex(theme.entity_color().as_hex());
+        let contributor = color_u8_from_hex(theme.contributor_color().as_hex());
+        Self {
+            primary_text: OverlayColor::rgba(245, 248, 252, 242),
+            secondary_text: OverlayColor::rgba(199, 214, 227, 220),
+            muted_text: OverlayColor::rgba(166, 190, 205, 180),
+            panel: OverlayColor::rgba(6, 12, 20, 146),
+            panel_strong: OverlayColor::rgba(5, 10, 16, 204),
+            label_backing: OverlayColor::rgba(5, 10, 16, 178),
+            rail: OverlayColor::rgba(160, 184, 202, 86),
+            structure_line: OverlayColor::rgba(188, 214, 230, 52),
+            accent: OverlayColor::rgba(entity[0], entity[1], entity[2], 232),
+            contributor: OverlayColor::rgba(contributor[0], contributor[1], contributor[2], 232),
+            entity: OverlayColor::rgba(entity[0], entity[1], entity[2], 220),
+            activity: OverlayColor::rgba(255, 255, 255, 240),
+        }
+    }
+}
+
+fn color_u8_from_hex(value: &str) -> [u8; 3] {
+    [
+        u8::from_str_radix(&value[1..3], 16).expect("validated render color"),
+        u8::from_str_radix(&value[3..5], 16).expect("validated render color"),
+        u8::from_str_radix(&value[5..7], 16).expect("validated render color"),
+    ]
+}
+
+fn draw_line(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    start: FramePoint,
+    end: FramePoint,
+    color: OverlayColor,
+) {
+    let mut x0 = start.x.round() as i32;
+    let mut y0 = start.y.round() as i32;
+    let x1 = end.x.round() as i32;
+    let y1 = end.y.round() as i32;
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        blend_pixel(pixels, frame_size, x0, y0, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn draw_rect(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    color: OverlayColor,
+) {
+    let left = x.max(0);
+    let top = y.max(0);
+    let right = (x + width).min(frame_size.width() as i32);
+    let bottom = (y + height).min(frame_size.height() as i32);
+    for pixel_y in top..bottom {
+        for pixel_x in left..right {
+            blend_pixel(pixels, frame_size, pixel_x, pixel_y, color);
+        }
+    }
+}
+
+fn draw_text(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    text: &str,
+    x: i32,
+    y: i32,
+    scale: i32,
+    color: OverlayColor,
+) {
+    let mut cursor_x = x;
+    for character in text.chars() {
+        draw_glyph(
+            pixels,
+            frame_size,
+            character.to_ascii_uppercase(),
+            cursor_x,
+            y,
+            scale,
+            color,
+        );
+        cursor_x += (TINY_FONT_WIDTH + 1) * scale;
+    }
+}
+
+fn draw_glyph(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    character: char,
+    x: i32,
+    y: i32,
+    scale: i32,
+    color: OverlayColor,
+) {
+    let glyph = tiny_glyph(character);
+    for (row_index, row) in glyph.iter().enumerate() {
+        for column in 0..TINY_FONT_WIDTH {
+            let bit = 1 << (TINY_FONT_WIDTH - column - 1);
+            if row & bit == 0 {
+                continue;
+            }
+            draw_rect(
+                pixels,
+                frame_size,
+                x + column * scale,
+                y + row_index as i32 * scale,
+                scale,
+                scale,
+                color,
+            );
+        }
+    }
+}
+
+fn text_pixel_width(text: &str, scale: i32) -> i32 {
+    (text.chars().count() as i32 * (TINY_FONT_WIDTH + 1) - 1) * scale
+}
+
+fn blend_pixel(
+    pixels: &mut [u8],
+    frame_size: RenderFrameSize,
+    x: i32,
+    y: i32,
+    color: OverlayColor,
+) {
+    if x < 0 || y < 0 || x >= frame_size.width() as i32 || y >= frame_size.height() as i32 {
+        return;
+    }
+    let index = ((y as u32 * frame_size.width() + x as u32) * BYTES_PER_PIXEL) as usize;
+    let alpha = f32::from(color.alpha) / 255.0;
+    let inverse_alpha = 1.0 - alpha;
+    pixels[index] = (f32::from(color.red) * alpha + f32::from(pixels[index]) * inverse_alpha) as u8;
+    pixels[index + 1] =
+        (f32::from(color.green) * alpha + f32::from(pixels[index + 1]) * inverse_alpha) as u8;
+    pixels[index + 2] =
+        (f32::from(color.blue) * alpha + f32::from(pixels[index + 2]) * inverse_alpha) as u8;
+    pixels[index + 3] = 255;
+}
+
+const TINY_FONT_WIDTH: i32 = 5;
+
+fn tiny_glyph(character: char) -> [u8; 7] {
+    match character {
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01111, 0b10000, 0b10000, 0b10011, 0b10001, 0b10001, 0b01111,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10011, 0b10101, 0b10101, 0b10101, 0b11001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        '/' => [
+            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        '_' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111,
+        ],
+        ':' => [
+            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+        '(' => [
+            0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010,
+        ],
+        ')' => [
+            0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000,
+        ],
+        '#' => [
+            0b01010, 0b01010, 0b11111, 0b01010, 0b11111, 0b01010, 0b01010,
+        ],
+        ' ' => [0; 7],
+        _ => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100, 0b00000,
+        ],
+    }
 }
 
 fn write_png(frame: &RenderedFrame, path: &Path) -> Result<(), RenderError> {
