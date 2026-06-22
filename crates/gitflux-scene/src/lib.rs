@@ -5,7 +5,8 @@
 //! Replay timeline, Repository Graph layout, repository entities, contributors,
 //! and Render Configuration without depending on Git, wgpu, or FFmpeg adapters.
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use toml::Value;
 
@@ -678,6 +679,683 @@ impl GitTimestamp {
     pub fn offset_minutes(self) -> i32 {
         self.offset_minutes
     }
+}
+
+/// Render-ready scene data for the Repository Graph layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryGraphScene {
+    mainline: String,
+    frame_size: SceneFrameSize,
+    frames_per_second: u32,
+    contributors: Vec<SceneContributor>,
+    directories: Vec<SceneDirectory>,
+    files: Vec<SceneFile>,
+    activities: Vec<SceneActivity>,
+    competing_changes: Vec<SceneCompetingChange>,
+}
+
+impl RepositoryGraphScene {
+    /// Builds a deterministic Repository Graph scene from Repository Replay events.
+    #[must_use]
+    pub fn from_replay(replay: &RepositoryReplay, configuration: &RenderConfiguration) -> Self {
+        let spacing = i32::try_from(configuration.layout().entity_spacing().get())
+            .expect("entity spacing fits scene coordinates");
+        let mut contributor_by_id = BTreeMap::<ContributorSceneId, SceneContributorSeed>::new();
+        let mut directory_paths = BTreeSet::<String>::new();
+        let mut file_paths = BTreeSet::<String>::new();
+
+        for commit_event in replay.commit_events() {
+            let contributor = commit_event.contributor();
+            contributor_by_id
+                .entry(ContributorSceneId(contributor.identity_key().to_owned()))
+                .or_insert_with(|| SceneContributorSeed {
+                    display_name: contributor.display_name().to_owned(),
+                    kind: contributor.kind(),
+                });
+
+            for file_change in commit_event.file_changes() {
+                collect_repository_entity_paths(
+                    file_change.entity(),
+                    &mut directory_paths,
+                    &mut file_paths,
+                );
+                if let Some(previous_entity) = file_change.previous_entity() {
+                    collect_repository_entity_paths(
+                        previous_entity,
+                        &mut directory_paths,
+                        &mut file_paths,
+                    );
+                }
+            }
+        }
+        for competing_change in replay.competing_changes() {
+            collect_repository_entity_paths(
+                competing_change.entity(),
+                &mut directory_paths,
+                &mut file_paths,
+            );
+        }
+
+        let contributors = contributor_by_id
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, seed))| SceneContributor {
+                id,
+                display_name: seed.display_name,
+                kind: seed.kind,
+                position: ScenePosition::new(index, 0, spacing),
+            })
+            .collect();
+
+        let directories = directory_paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| SceneDirectory {
+                id: DirectorySceneId(path.clone()),
+                path,
+                position: ScenePosition::new(index, 1, spacing),
+            })
+            .collect();
+
+        let files = file_paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| SceneFile {
+                id: FileSceneId(path.clone()),
+                parent_directory_id: parent_directory_id(Path::new(&path)),
+                path,
+                position: ScenePosition::new(index, 2, spacing),
+                motion: MotionState::Settled,
+            })
+            .collect();
+
+        let activities = replay
+            .commit_events()
+            .iter()
+            .enumerate()
+            .map(|(index, commit_event)| {
+                let playback_frame = u64::from(configuration.frames_per_second().get())
+                    * u64::try_from(index).expect("commit index fits playback frame");
+                SceneActivity {
+                    commit_id: CommitSceneId(commit_event.id().as_str().to_owned()),
+                    playback_frame,
+                    contributor_id: ContributorSceneId(
+                        commit_event.contributor().identity_key().to_owned(),
+                    ),
+                    branch_activity: SceneBranchActivity::from(commit_event.branch_flow()),
+                    file_changes: commit_event
+                        .file_changes()
+                        .iter()
+                        .map(|file_change| {
+                            SceneFileChange::from_file_change(
+                                file_change,
+                                MotionState::from(commit_event.branch_flow()),
+                            )
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        let competing_changes = replay
+            .competing_changes()
+            .iter()
+            .map(SceneCompetingChange::from)
+            .collect();
+
+        Self {
+            mainline: replay.mainline().as_str().to_owned(),
+            frame_size: SceneFrameSize {
+                width: configuration.frame_size().width(),
+                height: configuration.frame_size().height(),
+            },
+            frames_per_second: configuration.frames_per_second().get(),
+            contributors,
+            directories,
+            files,
+            activities,
+            competing_changes,
+        }
+    }
+
+    /// Returns the Mainline for this Repository Graph scene.
+    #[must_use]
+    pub fn mainline(&self) -> &str {
+        &self.mainline
+    }
+
+    /// Returns the configured scene frame size.
+    #[must_use]
+    pub fn frame_size(&self) -> SceneFrameSize {
+        self.frame_size
+    }
+
+    /// Returns the configured render frame rate.
+    #[must_use]
+    pub fn frames_per_second(&self) -> u32 {
+        self.frames_per_second
+    }
+
+    /// Returns scene Contributors in deterministic layout order.
+    #[must_use]
+    pub fn contributors(&self) -> &[SceneContributor] {
+        &self.contributors
+    }
+
+    /// Returns scene directories in deterministic layout order.
+    #[must_use]
+    pub fn directories(&self) -> &[SceneDirectory] {
+        &self.directories
+    }
+
+    /// Returns scene files in deterministic layout order.
+    #[must_use]
+    pub fn files(&self) -> &[SceneFile] {
+        &self.files
+    }
+
+    /// Returns timed Commit Event activity in replay order.
+    #[must_use]
+    pub fn activities(&self) -> &[SceneActivity] {
+        &self.activities
+    }
+
+    /// Returns provisional Competing Changes preserved for scene rendering.
+    #[must_use]
+    pub fn competing_changes(&self) -> &[SceneCompetingChange] {
+        &self.competing_changes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SceneContributorSeed {
+    display_name: String,
+    kind: ContributorKind,
+}
+
+/// Output frame dimensions copied into render-ready scene data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneFrameSize {
+    width: u32,
+    height: u32,
+}
+
+impl SceneFrameSize {
+    /// Returns the scene frame width in pixels.
+    #[must_use]
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Returns the scene frame height in pixels.
+    #[must_use]
+    pub fn height(self) -> u32 {
+        self.height
+    }
+}
+
+/// A stable scene identifier for a Contributor.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContributorSceneId(String);
+
+impl ContributorSceneId {
+    /// Returns the stable Contributor scene identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A stable scene identifier for a directory Repository Entity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DirectorySceneId(String);
+
+impl DirectorySceneId {
+    /// Returns the stable directory scene identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A stable scene identifier for a file Repository Entity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileSceneId(String);
+
+impl FileSceneId {
+    /// Returns the stable file scene identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A stable scene identifier for a Commit Event.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CommitSceneId(String);
+
+impl CommitSceneId {
+    /// Returns the stable Commit Event scene identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Deterministic scene-space position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScenePosition {
+    x: i32,
+    y: i32,
+}
+
+impl ScenePosition {
+    fn new(index: usize, row: i32, spacing: i32) -> Self {
+        Self {
+            x: i32::try_from(index).expect("scene index fits coordinates") * spacing,
+            y: row * spacing,
+        }
+    }
+
+    /// Returns the deterministic x coordinate.
+    #[must_use]
+    pub fn x(self) -> i32 {
+        self.x
+    }
+
+    /// Returns the deterministic y coordinate.
+    #[must_use]
+    pub fn y(self) -> i32 {
+        self.y
+    }
+}
+
+/// Render-ready Contributor node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneContributor {
+    id: ContributorSceneId,
+    display_name: String,
+    kind: ContributorKind,
+    position: ScenePosition,
+}
+
+impl SceneContributor {
+    /// Returns the Contributor scene identifier.
+    #[must_use]
+    pub fn id(&self) -> &ContributorSceneId {
+        &self.id
+    }
+
+    /// Returns the display name.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// Returns whether this Contributor is human or automation.
+    #[must_use]
+    pub fn kind(&self) -> ContributorKind {
+        self.kind
+    }
+
+    /// Returns the deterministic scene position.
+    #[must_use]
+    pub fn position(&self) -> ScenePosition {
+        self.position
+    }
+}
+
+/// Render-ready directory node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneDirectory {
+    id: DirectorySceneId,
+    path: String,
+    position: ScenePosition,
+}
+
+impl SceneDirectory {
+    /// Returns the directory scene identifier.
+    #[must_use]
+    pub fn id(&self) -> &DirectorySceneId {
+        &self.id
+    }
+
+    /// Returns the repository-relative directory path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the deterministic scene position.
+    #[must_use]
+    pub fn position(&self) -> ScenePosition {
+        self.position
+    }
+}
+
+/// Render-ready file node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneFile {
+    id: FileSceneId,
+    path: String,
+    parent_directory_id: Option<DirectorySceneId>,
+    position: ScenePosition,
+    motion: MotionState,
+}
+
+impl SceneFile {
+    /// Returns the file scene identifier.
+    #[must_use]
+    pub fn id(&self) -> &FileSceneId {
+        &self.id
+    }
+
+    /// Returns the repository-relative file path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the containing directory scene identifier, if any.
+    #[must_use]
+    pub fn parent_directory_id(&self) -> Option<&DirectorySceneId> {
+        self.parent_directory_id.as_ref()
+    }
+
+    /// Returns the deterministic scene position.
+    #[must_use]
+    pub fn position(&self) -> ScenePosition {
+        self.position
+    }
+
+    /// Returns the basic motion state.
+    #[must_use]
+    pub fn motion(&self) -> MotionState {
+        self.motion
+    }
+}
+
+/// Basic scene motion state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionState {
+    /// Repository Entity has settled into the main Repository Graph.
+    Settled,
+    /// Repository Entity is provisional branch work before Merge Settlement.
+    Provisional,
+    /// Repository Entity is settling from branch work into the Mainline.
+    Settling,
+}
+
+impl From<&BranchFlow> for MotionState {
+    fn from(branch_flow: &BranchFlow) -> Self {
+        match branch_flow {
+            BranchFlow::Mainline => Self::Settled,
+            BranchFlow::BranchSuperposition { .. } => Self::Provisional,
+            BranchFlow::MergeSettlements(_) => Self::Settling,
+        }
+    }
+}
+
+/// Timed activity derived from one Commit Event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneActivity {
+    commit_id: CommitSceneId,
+    playback_frame: u64,
+    contributor_id: ContributorSceneId,
+    branch_activity: SceneBranchActivity,
+    file_changes: Vec<SceneFileChange>,
+}
+
+impl SceneActivity {
+    /// Returns the Commit Event scene identifier.
+    #[must_use]
+    pub fn commit_id(&self) -> &CommitSceneId {
+        &self.commit_id
+    }
+
+    /// Returns the playback frame where this activity begins.
+    #[must_use]
+    pub fn playback_frame(&self) -> u64 {
+        self.playback_frame
+    }
+
+    /// Returns the Contributor responsible for the activity.
+    #[must_use]
+    pub fn contributor_id(&self) -> &ContributorSceneId {
+        &self.contributor_id
+    }
+
+    /// Returns the branch-flow scene activity.
+    #[must_use]
+    pub fn branch_activity(&self) -> &SceneBranchActivity {
+        &self.branch_activity
+    }
+
+    /// Returns File Changes for this activity.
+    #[must_use]
+    pub fn file_changes(&self) -> &[SceneFileChange] {
+        &self.file_changes
+    }
+}
+
+/// Branch-flow state preserved for scene activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SceneBranchActivity {
+    /// Activity belongs to the Mainline.
+    Mainline,
+    /// Activity is provisional branch work relative to the Mainline.
+    BranchSuperposition { branch: String, mainline: String },
+    /// Activity settles provisional branch work into the Mainline.
+    MergeSettlements(Vec<SceneMergeSettlement>),
+}
+
+/// Render-ready Merge Settlement activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneMergeSettlement {
+    branch: String,
+    mainline: String,
+    settled_commit_ids: Vec<CommitSceneId>,
+}
+
+impl SceneMergeSettlement {
+    /// Returns the branch being settled.
+    #[must_use]
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Returns the Mainline receiving the settled branch work.
+    #[must_use]
+    pub fn mainline(&self) -> &str {
+        &self.mainline
+    }
+
+    /// Returns settled Commit Event identifiers.
+    #[must_use]
+    pub fn settled_commit_ids(&self) -> &[CommitSceneId] {
+        &self.settled_commit_ids
+    }
+}
+
+impl From<&BranchFlow> for SceneBranchActivity {
+    fn from(branch_flow: &BranchFlow) -> Self {
+        match branch_flow {
+            BranchFlow::Mainline => Self::Mainline,
+            BranchFlow::BranchSuperposition { branch, mainline } => Self::BranchSuperposition {
+                branch: branch.clone(),
+                mainline: mainline.as_str().to_owned(),
+            },
+            BranchFlow::MergeSettlements(settlements) => Self::MergeSettlements(
+                settlements
+                    .iter()
+                    .map(|settlement| SceneMergeSettlement {
+                        branch: settlement.branch().to_owned(),
+                        mainline: settlement.mainline().as_str().to_owned(),
+                        settled_commit_ids: settlement
+                            .settled_commit_ids()
+                            .iter()
+                            .map(|commit_id| CommitSceneId(commit_id.as_str().to_owned()))
+                            .collect(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Render-ready File Change activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneFileChange {
+    file_id: FileSceneId,
+    previous_file_id: Option<FileSceneId>,
+    kind: FileChangeKind,
+    motion: MotionState,
+}
+
+impl SceneFileChange {
+    /// Returns the file affected by this File Change.
+    #[must_use]
+    pub fn file_id(&self) -> &FileSceneId {
+        &self.file_id
+    }
+
+    /// Returns the previous file identifier for moved File Changes.
+    #[must_use]
+    pub fn previous_file_id(&self) -> Option<&FileSceneId> {
+        self.previous_file_id.as_ref()
+    }
+
+    /// Returns the File Change kind.
+    #[must_use]
+    pub fn kind(&self) -> FileChangeKind {
+        self.kind
+    }
+
+    /// Returns the motion state for this File Change.
+    #[must_use]
+    pub fn motion(&self) -> MotionState {
+        self.motion
+    }
+}
+
+impl From<&FileChange> for SceneFileChange {
+    fn from(file_change: &FileChange) -> Self {
+        Self::from_file_change(file_change, MotionState::Settled)
+    }
+}
+
+impl SceneFileChange {
+    fn from_file_change(file_change: &FileChange, motion: MotionState) -> Self {
+        Self {
+            file_id: FileSceneId(repository_entity_path(file_change.entity())),
+            previous_file_id: file_change
+                .previous_entity()
+                .map(|entity| FileSceneId(repository_entity_path(entity))),
+            kind: *file_change.kind(),
+            motion,
+        }
+    }
+}
+
+/// Render-ready Competing Change activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneCompetingChange {
+    file_id: FileSceneId,
+    source: CompetingChangeSource,
+    confidence: CompetingChangeConfidence,
+    evidence: Vec<SceneCompetingChangeEvidence>,
+}
+
+impl SceneCompetingChange {
+    /// Returns the file with overlapping provisional changes.
+    #[must_use]
+    pub fn file_id(&self) -> &FileSceneId {
+        &self.file_id
+    }
+
+    /// Returns how the Competing Change was detected.
+    #[must_use]
+    pub fn source(&self) -> CompetingChangeSource {
+        self.source
+    }
+
+    /// Returns the confidence level for this Competing Change.
+    #[must_use]
+    pub fn confidence(&self) -> CompetingChangeConfidence {
+        self.confidence
+    }
+
+    /// Returns branch evidence for this Competing Change.
+    #[must_use]
+    pub fn evidence(&self) -> &[SceneCompetingChangeEvidence] {
+        &self.evidence
+    }
+}
+
+impl From<&CompetingChange> for SceneCompetingChange {
+    fn from(competing_change: &CompetingChange) -> Self {
+        Self {
+            file_id: FileSceneId(repository_entity_path(competing_change.entity())),
+            source: competing_change.source(),
+            confidence: competing_change.confidence(),
+            evidence: competing_change
+                .evidence()
+                .iter()
+                .map(|evidence| SceneCompetingChangeEvidence {
+                    branch: evidence.branch().to_owned(),
+                    commit_id: CommitSceneId(evidence.commit_id().as_str().to_owned()),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Branch evidence for a render-ready Competing Change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneCompetingChangeEvidence {
+    branch: String,
+    commit_id: CommitSceneId,
+}
+
+impl SceneCompetingChangeEvidence {
+    /// Returns the branch carrying provisional work.
+    #[must_use]
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Returns the Commit Event carrying provisional work.
+    #[must_use]
+    pub fn commit_id(&self) -> &CommitSceneId {
+        &self.commit_id
+    }
+}
+
+fn collect_repository_entity_paths(
+    entity: &RepositoryEntity,
+    directory_paths: &mut BTreeSet<String>,
+    file_paths: &mut BTreeSet<String>,
+) {
+    let path = repository_entity_path(entity);
+    file_paths.insert(path.clone());
+
+    let mut current = Path::new(&path).parent();
+    while let Some(parent) = current {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        directory_paths.insert(parent.to_string_lossy().into_owned());
+        current = parent.parent();
+    }
+}
+
+fn repository_entity_path(entity: &RepositoryEntity) -> String {
+    entity.path().to_string_lossy().into_owned()
+}
+
+fn parent_directory_id(path: &Path) -> Option<DirectorySceneId> {
+    let parent = path.parent()?;
+    (!parent.as_os_str().is_empty())
+        .then(|| DirectorySceneId(parent.to_string_lossy().into_owned()))
 }
 
 /// A reusable set of parameters for rendering a Repository Replay.
@@ -1402,8 +2080,10 @@ pub struct ConfigValueError;
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchFlow, CommitEvent, CommitId, Contributor, FileChange, FileChangeKind, Mainline,
-        RenderConfiguration, RepositoryEntity, RepositoryReplay,
+        BranchFlow, CommitEvent, CommitEvidence, CommitId, CommitSubject, CompetingChange,
+        CompetingChangeConfidence, CompetingChangeEvidence, CompetingChangeSource, Contributor,
+        ContributorEvidence, FileChange, FileChangeKind, GitTimestamp, Mainline, MergeSettlement,
+        RenderConfiguration, RepositoryEntity, RepositoryGraphScene, RepositoryReplay,
     };
 
     #[test]
@@ -1609,5 +2289,386 @@ frame_height =
 
         assert!(message.contains("toml"));
         assert!(message.contains("valid TOML Render Configuration"));
+    }
+
+    #[test]
+    fn repository_graph_scene_snapshots_linear_replay() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("a1"),
+            Contributor::human("Ada"),
+            vec![FileChange::new(
+                RepositoryEntity::new("src/lib.rs"),
+                FileChangeKind::Added,
+            )],
+        ));
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("b2"),
+            Contributor::human("Grace"),
+            vec![
+                FileChange::new(RepositoryEntity::new("README.md"), FileChangeKind::Added),
+                FileChange::new(
+                    RepositoryEntity::new("src/lib.rs"),
+                    FileChangeKind::Modified,
+                ),
+            ],
+        ));
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &RenderConfiguration::default());
+
+        assert_eq!(
+            format!("{scene:#?}"),
+            r#"RepositoryGraphScene {
+    mainline: "main",
+    frame_size: SceneFrameSize {
+        width: 1920,
+        height: 1080,
+    },
+    frames_per_second: 60,
+    contributors: [
+        SceneContributor {
+            id: ContributorSceneId(
+                "Ada",
+            ),
+            display_name: "Ada",
+            kind: Human,
+            position: ScenePosition {
+                x: 0,
+                y: 0,
+            },
+        },
+        SceneContributor {
+            id: ContributorSceneId(
+                "Grace",
+            ),
+            display_name: "Grace",
+            kind: Human,
+            position: ScenePosition {
+                x: 120,
+                y: 0,
+            },
+        },
+    ],
+    directories: [
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src",
+            ),
+            path: "src",
+            position: ScenePosition {
+                x: 0,
+                y: 120,
+            },
+        },
+    ],
+    files: [
+        SceneFile {
+            id: FileSceneId(
+                "README.md",
+            ),
+            path: "README.md",
+            parent_directory_id: None,
+            position: ScenePosition {
+                x: 0,
+                y: 240,
+            },
+            motion: Settled,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/lib.rs",
+            ),
+            path: "src/lib.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src",
+                ),
+            ),
+            position: ScenePosition {
+                x: 120,
+                y: 240,
+            },
+            motion: Settled,
+        },
+    ],
+    activities: [
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "a1",
+            ),
+            playback_frame: 0,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/lib.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "b2",
+            ),
+            playback_frame: 60,
+            contributor_id: ContributorSceneId(
+                "Grace",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "README.md",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/lib.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Modified,
+                    motion: Settled,
+                },
+            ],
+        },
+    ],
+    competing_changes: [],
+}"#
+        );
+    }
+
+    #[test]
+    fn repository_graph_scene_preserves_branch_and_merge_activity() {
+        let mainline = Mainline::new("main");
+        let mut replay = RepositoryReplay::new(mainline.clone());
+        let contributor = Contributor::human("Ada");
+        let evidence = ContributorEvidence::new("Ada", "ada@example.com", GitTimestamp::new(1, 0));
+
+        replay.push_commit_event(CommitEvent::from_evidence(
+            CommitEvidence::new(
+                CommitId::new("a1"),
+                CommitSubject::new("base"),
+                evidence.clone(),
+                evidence.clone(),
+                contributor.clone(),
+            )
+            .with_file_changes(vec![FileChange::new(
+                RepositoryEntity::new("src/lib.rs"),
+                FileChangeKind::Added,
+            )]),
+        ));
+        replay.push_commit_event(CommitEvent::from_evidence(
+            CommitEvidence::new(
+                CommitId::new("b1"),
+                CommitSubject::new("feature work"),
+                evidence.clone(),
+                evidence.clone(),
+                contributor.clone(),
+            )
+            .with_parent_ids(vec![CommitId::new("a1")])
+            .with_branch_flow(BranchFlow::BranchSuperposition {
+                branch: "feature".to_owned(),
+                mainline: mainline.clone(),
+            })
+            .with_file_changes(vec![FileChange::new(
+                RepositoryEntity::new("src/lib.rs"),
+                FileChangeKind::Modified,
+            )]),
+        ));
+        replay.push_commit_event(CommitEvent::from_evidence(
+            CommitEvidence::new(
+                CommitId::new("m1"),
+                CommitSubject::new("merge feature"),
+                evidence.clone(),
+                evidence,
+                contributor,
+            )
+            .with_parent_ids(vec![CommitId::new("a1"), CommitId::new("b1")])
+            .with_branch_flow(BranchFlow::MergeSettlements(vec![MergeSettlement::new(
+                "feature",
+                mainline,
+                vec![CommitId::new("b1")],
+            )]))
+            .with_file_changes(vec![FileChange::new(
+                RepositoryEntity::new("src/lib.rs"),
+                FileChangeKind::Modified,
+            )]),
+        ));
+        replay.push_competing_change(CompetingChange::new(
+            RepositoryEntity::new("src/lib.rs"),
+            CompetingChangeSource::FileLevelOverlap,
+            CompetingChangeConfidence::Medium,
+            vec![
+                CompetingChangeEvidence::new("feature", CommitId::new("b1")),
+                CompetingChangeEvidence::new("main", CommitId::new("a1")),
+            ],
+        ));
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &RenderConfiguration::default());
+
+        assert_eq!(
+            format!("{scene:#?}"),
+            r#"RepositoryGraphScene {
+    mainline: "main",
+    frame_size: SceneFrameSize {
+        width: 1920,
+        height: 1080,
+    },
+    frames_per_second: 60,
+    contributors: [
+        SceneContributor {
+            id: ContributorSceneId(
+                "Ada",
+            ),
+            display_name: "Ada",
+            kind: Human,
+            position: ScenePosition {
+                x: 0,
+                y: 0,
+            },
+        },
+    ],
+    directories: [
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src",
+            ),
+            path: "src",
+            position: ScenePosition {
+                x: 0,
+                y: 120,
+            },
+        },
+    ],
+    files: [
+        SceneFile {
+            id: FileSceneId(
+                "src/lib.rs",
+            ),
+            path: "src/lib.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src",
+                ),
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 240,
+            },
+            motion: Settled,
+        },
+    ],
+    activities: [
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "a1",
+            ),
+            playback_frame: 0,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/lib.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "b1",
+            ),
+            playback_frame: 60,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: BranchSuperposition {
+                branch: "feature",
+                mainline: "main",
+            },
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/lib.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Modified,
+                    motion: Provisional,
+                },
+            ],
+        },
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "m1",
+            ),
+            playback_frame: 120,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: MergeSettlements(
+                [
+                    SceneMergeSettlement {
+                        branch: "feature",
+                        mainline: "main",
+                        settled_commit_ids: [
+                            CommitSceneId(
+                                "b1",
+                            ),
+                        ],
+                    },
+                ],
+            ),
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/lib.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Modified,
+                    motion: Settling,
+                },
+            ],
+        },
+    ],
+    competing_changes: [
+        SceneCompetingChange {
+            file_id: FileSceneId(
+                "src/lib.rs",
+            ),
+            source: FileLevelOverlap,
+            confidence: Medium,
+            evidence: [
+                SceneCompetingChangeEvidence {
+                    branch: "feature",
+                    commit_id: CommitSceneId(
+                        "b1",
+                    ),
+                },
+                SceneCompetingChangeEvidence {
+                    branch: "main",
+                    commit_id: CommitSceneId(
+                        "a1",
+                    ),
+                },
+            ],
+        },
+    ],
+}"#
+        );
     }
 }
