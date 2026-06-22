@@ -1,0 +1,9 @@
+[package]
+name = "gitflux-preview"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gitflux-render.workspace = true
+gitflux-scene.workspace = true
+minifb = "0.27.0"

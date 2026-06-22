@@ -7,7 +7,7 @@
 use std::env;
 use std::fs;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gitflux_export::{
@@ -17,6 +17,11 @@ use gitflux_export::{
     VideoExportRequest,
 };
 use gitflux_ingestion::{ingest_repository, RepositoryIngestionRequest};
+use gitflux_preview::{
+    run_preview_session, NativePreviewWindowAdapter, PreviewConfigurationSource,
+    PreviewReloadPolicy, PreviewReloadWatch, PreviewRunSummary, PreviewSessionPlan,
+    PreviewWindowAdapter, PreviewWindowStatus,
+};
 use gitflux_render::{FrameCount, RenderPlan};
 use gitflux_scene::{Layout, Mainline, RenderConfiguration, ReplayPacingDuration};
 use sha2::{Digest, Sha256};
@@ -27,6 +32,7 @@ Gitflux command-line interface
 Usage:
   gitflux [OPTIONS]
   gitflux render <repository-path> --output <output-path>
+  gitflux preview <repository-path>
 
 Options:
   -h, --help       Print help
@@ -56,6 +62,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
         None | Some("-h") | Some("--help") => Ok(HELP.to_owned()),
         Some("-V") | Some("--version") => Ok(format!("gitflux {}\n", env!("CARGO_PKG_VERSION"))),
         Some("render") => run_render(args),
+        Some("preview") => run_preview(args),
         Some(flag) => Err(format!("unrecognized option: {flag}\n\n{HELP}")),
     }
 }
@@ -69,6 +76,13 @@ fn run_render(args: impl IntoIterator<Item = String>) -> Result<String, String> 
     }
 
     Ok(render_human_summary(&config, &execution))
+}
+
+fn run_preview(args: impl IntoIterator<Item = String>) -> Result<String, String> {
+    let config = parse_preview_args(args)?;
+    let execution = execute_preview(&config)?;
+
+    Ok(preview_human_summary(&config, &execution))
 }
 
 fn execute_render(config: &RenderCommand) -> Result<RenderExecution, String> {
@@ -114,6 +128,36 @@ fn execute_render(config: &RenderCommand) -> Result<RenderExecution, String> {
     })
 }
 
+fn execute_preview(config: &PreviewCommand) -> Result<PreviewExecution, String> {
+    let mut adapter = NativePreviewWindowAdapter::default();
+    execute_preview_with_adapter(config, &mut adapter)
+}
+
+fn execute_preview_with_adapter(
+    config: &PreviewCommand,
+    adapter: &mut dyn PreviewWindowAdapter,
+) -> Result<PreviewExecution, String> {
+    let ingestion_request = config.ingestion_request();
+    let ingestion_summary = ingest_repository(&ingestion_request)
+        .map_err(|error| format!("failed to ingest repository: {error}"))?;
+    let replay = ingestion_summary.replay().clone();
+    let plan = PreviewSessionPlan::new(
+        RenderPlan::new(replay, config.render_configuration.clone()),
+        config.configuration_source(),
+        config.reload_policy,
+    );
+    let config_watcher = plan
+        .config_watcher()
+        .map_err(|error| error.to_string())?
+        .is_some();
+    let summary = run_preview_session(&plan, adapter).map_err(|error| error.to_string())?;
+
+    Ok(PreviewExecution {
+        summary,
+        config_watcher,
+    })
+}
+
 fn render_human_summary(config: &RenderCommand, execution: &RenderExecution) -> String {
     let mut output = String::new();
     output.push_str("Gitflux Render complete\n");
@@ -155,6 +199,42 @@ fn render_json_progress(_config: &RenderCommand, execution: &RenderExecution) ->
         );
         output.push('\n');
     }
+
+    output
+}
+
+fn preview_human_summary(config: &PreviewCommand, execution: &PreviewExecution) -> String {
+    let mut output = String::new();
+    let window = execution.summary.window();
+
+    output.push_str("Gitflux Preview complete\n");
+    output.push_str(&format!(
+        "Repository path: {}\n",
+        config.repository_path.display()
+    ));
+    output.push_str(&format!("Mainline: {}\n", config.mainline.as_label()));
+    output.push_str(&format!(
+        "Render Configuration: {}\n",
+        config.render_configuration_label()
+    ));
+    output.push_str(&format!(
+        "Window: {} ({}x{})\n",
+        preview_window_status_label(execution.summary.window_status()),
+        window.width(),
+        window.height()
+    ));
+    output.push_str(&format!(
+        "Shared renderer frame: {}\n",
+        if execution.summary.rendered_initial_frame() {
+            "rendered"
+        } else {
+            "not rendered"
+        }
+    ));
+    output.push_str(&format!(
+        "Config hot reload: {}\n",
+        preview_reload_label(execution.summary.reload_watch(), execution.config_watcher)
+    ));
 
     output
 }
@@ -206,20 +286,13 @@ fn parse_render_args(args: impl IntoIterator<Item = String>) -> Result<RenderCom
         output_path.ok_or_else(|| "missing required --output <output-path>".to_owned())?;
 
     if !repository_path.exists() {
-        return Err(format!(
-            "repository path does not exist: {}",
-            repository_path.display()
-        ));
+        return Err(missing_repository_path_error(&repository_path));
     }
 
-    if !repository_path.is_dir() {
-        return Err(format!(
-            "repository path is not a directory: {}",
-            repository_path.display()
-        ));
-    }
+    validate_repository_directory(&repository_path)?;
 
-    let render_configuration = load_render_configuration(config_path.as_ref())?;
+    let render_configuration =
+        load_render_configuration(config_path.as_ref(), "Render Configuration")?;
 
     Ok(RenderCommand {
         repository_path,
@@ -232,24 +305,92 @@ fn parse_render_args(args: impl IntoIterator<Item = String>) -> Result<RenderCom
     })
 }
 
-fn load_render_configuration(config_path: Option<&PathBuf>) -> Result<RenderConfiguration, String> {
+fn parse_preview_args(args: impl IntoIterator<Item = String>) -> Result<PreviewCommand, String> {
+    let mut args = args.into_iter();
+    let repository_path = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("missing repository path\n\n{HELP}"))?;
+    let mut config_path = None;
+    let mut mainline = MainlineSelection::Detect;
+    let mut reload_policy = PreviewReloadPolicy::ConfigFileMetadata;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                config_path = args.next().map(PathBuf::from);
+                if config_path.is_none() {
+                    return Err("missing render configuration path after --config".to_owned());
+                }
+            }
+            "--mainline" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing Mainline name after --mainline".to_owned())?;
+                mainline = MainlineSelection::Explicit(Mainline::new(value));
+            }
+            "--no-config-reload" => reload_policy = PreviewReloadPolicy::Disabled,
+            flag => return Err(format!("unrecognized preview option: {flag}")),
+        }
+    }
+
+    if !repository_path.exists() {
+        return Err(missing_repository_path_error(&repository_path));
+    }
+
+    validate_repository_directory(&repository_path)?;
+
+    let render_configuration =
+        load_render_configuration(config_path.as_ref(), "Preview Render Configuration")?;
+
+    Ok(PreviewCommand {
+        repository_path,
+        config_path,
+        mainline,
+        render_configuration,
+        reload_policy,
+    })
+}
+
+fn load_render_configuration(
+    config_path: Option<&PathBuf>,
+    configuration_label: &str,
+) -> Result<RenderConfiguration, String> {
     let Some(config_path) = config_path else {
         return Ok(RenderConfiguration::default());
     };
 
     let contents = fs::read_to_string(config_path).map_err(|error| {
         format!(
-            "failed to read Render Configuration {}: {error}",
+            "failed to read {configuration_label} {}: {error}",
             config_path.display()
         )
     })?;
 
     RenderConfiguration::from_toml_str(&contents).map_err(|error| {
         format!(
-            "failed to load Render Configuration {}:\n{error}",
+            "failed to load {configuration_label} {}:\n{error}",
             config_path.display()
         )
     })
+}
+
+fn validate_repository_directory(repository_path: &Path) -> Result<(), String> {
+    if !repository_path.is_dir() {
+        return Err(format!(
+            "repository path is not a directory: {}",
+            repository_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn missing_repository_path_error(repository_path: &Path) -> String {
+    format!(
+        "repository path does not exist: {}",
+        repository_path.display()
+    )
 }
 
 struct RenderCommand {
@@ -265,6 +406,19 @@ struct RenderCommand {
 struct RenderExecution {
     export_manifest: ExportManifest,
     progress_events: Vec<ExportProgressEvent>,
+}
+
+struct PreviewCommand {
+    repository_path: PathBuf,
+    config_path: Option<PathBuf>,
+    mainline: MainlineSelection,
+    render_configuration: RenderConfiguration,
+    reload_policy: PreviewReloadPolicy,
+}
+
+struct PreviewExecution {
+    summary: PreviewRunSummary,
+    config_watcher: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,28 +456,7 @@ impl RenderCommand {
     }
 
     fn render_configuration_label(&self) -> String {
-        let source = self
-            .config_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "defaults".to_owned());
-        let frame_size = self.render_configuration.frame_size();
-        let layout_name = match self.render_configuration.layout() {
-            Layout::RepositoryGraph | Layout::RepositoryGraphWithParameters(_) => {
-                "Repository Graph"
-            }
-            Layout::Named(_) => "Named Layout",
-        };
-
-        format!(
-            "{} (theme: {}, {}x{}, {} FPS, layout: {})",
-            source,
-            self.render_configuration.theme().name(),
-            frame_size.width(),
-            frame_size.height(),
-            self.render_configuration.frames_per_second().get(),
-            layout_name
-        )
+        render_configuration_label(&self.render_configuration, self.config_path.as_ref())
     }
 
     fn manifest_context(
@@ -395,6 +528,30 @@ impl RenderCommand {
     }
 }
 
+impl PreviewCommand {
+    fn ingestion_request(&self) -> RepositoryIngestionRequest {
+        match &self.mainline {
+            MainlineSelection::Detect => {
+                RepositoryIngestionRequest::detect_mainline(&self.repository_path)
+            }
+            MainlineSelection::Explicit(mainline) => {
+                RepositoryIngestionRequest::new(&self.repository_path, mainline.clone())
+            }
+        }
+    }
+
+    fn configuration_source(&self) -> PreviewConfigurationSource {
+        self.config_path
+            .clone()
+            .map(PreviewConfigurationSource::File)
+            .unwrap_or(PreviewConfigurationSource::Defaults)
+    }
+
+    fn render_configuration_label(&self) -> String {
+        render_configuration_label(&self.render_configuration, self.config_path.as_ref())
+    }
+}
+
 fn render_phase_label(phase: ExportProgressPhase) -> &'static str {
     match phase {
         ExportProgressPhase::Ingestion => "Repository Ingestion",
@@ -407,9 +564,53 @@ fn render_phase_label(phase: ExportProgressPhase) -> &'static str {
     }
 }
 
+fn render_configuration_label(
+    render_configuration: &RenderConfiguration,
+    config_path: Option<&PathBuf>,
+) -> String {
+    let source = config_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "defaults".to_owned());
+    let frame_size = render_configuration.frame_size();
+    let layout_name = match render_configuration.layout() {
+        Layout::RepositoryGraph | Layout::RepositoryGraphWithParameters(_) => "Repository Graph",
+        Layout::Named(_) => "Named Layout",
+    };
+
+    format!(
+        "{} (theme: {}, {}x{}, {} FPS, layout: {})",
+        source,
+        render_configuration.theme().name(),
+        frame_size.width(),
+        frame_size.height(),
+        render_configuration.frames_per_second().get(),
+        layout_name
+    )
+}
+
+fn preview_window_status_label(status: &PreviewWindowStatus) -> &'static str {
+    match status {
+        PreviewWindowStatus::Opened => "opened",
+        PreviewWindowStatus::Planned(_) => "planned by minimal adapter",
+    }
+}
+
+fn preview_reload_label(status: PreviewReloadWatch, watcher_initialized: bool) -> &'static str {
+    match (status, watcher_initialized) {
+        (PreviewReloadWatch::WatchingConfigFile, true) => "watching config file metadata",
+        (PreviewReloadWatch::WatchingConfigFile, false) => "planned for config file metadata",
+        (PreviewReloadWatch::NoConfigFile, _) => "no config file supplied",
+        (PreviewReloadWatch::Disabled, _) => "disabled",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_render_args, run};
+    use super::{
+        execute_preview_with_adapter, parse_preview_args, parse_render_args, preview_human_summary,
+        run,
+    };
+    use gitflux_preview::{PlanningPreviewWindowAdapter, PreviewReloadPolicy};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -743,6 +944,140 @@ settle_iterations = 80
         assert!(output.contains("1280x720"));
         assert!(output.contains("30 FPS"));
         assert!(output.contains("Repository Graph"));
+    }
+
+    #[test]
+    fn preview_plan_reports_shared_replay_and_render_configuration() {
+        let fixture = CliGitFixture::new("preview-plan");
+        let config_path = write_temp_render_config(
+            "preview-valid",
+            r##"
+frame_width = 1280
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "terminal"
+background_color = "#101010"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+"##,
+        );
+
+        let command = parse_preview_args([
+            fixture.path().display().to_string(),
+            "--config".to_owned(),
+            config_path.display().to_string(),
+            "--mainline".to_owned(),
+            "main".to_owned(),
+        ])
+        .expect("preview should build a session plan");
+        let mut adapter = PlanningPreviewWindowAdapter;
+        let execution = execute_preview_with_adapter(&command, &mut adapter)
+            .expect("injected preview adapter should execute");
+        let output = preview_human_summary(&command, &execution);
+
+        assert!(output.contains("Gitflux Preview complete"));
+        assert!(output.contains("Mainline: main"));
+        assert!(output.contains("terminal"));
+        assert!(output.contains("1280x720"));
+        assert!(output.contains("Window: planned by minimal adapter (1280x720)"));
+        assert!(output.contains("Shared renderer frame: not rendered"));
+        assert!(output.contains("Config hot reload: watching config file metadata"));
+    }
+
+    #[test]
+    fn preview_defaults_to_metadata_reload() {
+        let fixture = CliGitFixture::new("preview-parse");
+        let command = parse_preview_args([fixture.path().display().to_string()])
+            .expect("preview defaults should parse");
+
+        assert_eq!(
+            command.reload_policy,
+            PreviewReloadPolicy::ConfigFileMetadata
+        );
+    }
+
+    #[test]
+    fn preview_rejects_public_plan_only_flag() {
+        let fixture = CliGitFixture::new("preview-flags");
+        let result = parse_preview_args([
+            fixture.path().display().to_string(),
+            "--plan-only".to_owned(),
+        ]);
+        let error = match result {
+            Ok(_) => panic!("plan-only should not be public CLI"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("unrecognized preview option: --plan-only"));
+    }
+
+    #[test]
+    fn preview_accepts_no_reload_flag() {
+        let fixture = CliGitFixture::new("preview-no-reload");
+        let command = parse_preview_args([
+            fixture.path().display().to_string(),
+            "--no-config-reload".to_owned(),
+        ])
+        .expect("preview flags should parse");
+
+        assert_eq!(command.reload_policy, PreviewReloadPolicy::Disabled);
+    }
+
+    #[test]
+    fn preview_rejects_invalid_configuration_file_with_diagnostics() {
+        let fixture = CliGitFixture::new("preview-invalid");
+        let config_path = write_temp_render_config(
+            "preview-invalid",
+            r##"
+frame_width = 0
+frame_height = 720
+frames_per_second = 30
+
+[theme]
+name = "bad"
+background_color = "blue"
+entity_color = "#32d583"
+contributor_color = "#fdb022"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 140
+settle_iterations = 80
+"##,
+        );
+
+        let error = run([
+            "preview".to_owned(),
+            fixture.path().display().to_string(),
+            "--config".to_owned(),
+            config_path.display().to_string(),
+        ])
+        .expect_err("invalid Preview Render Configuration should fail");
+
+        assert!(error.contains("failed to load Preview Render Configuration"));
+        assert!(error.contains("frame_width"));
+        assert!(error.contains("theme.background_color"));
+    }
+
+    #[test]
+    fn preview_default_command_can_use_injected_test_adapter() {
+        let fixture = CliGitFixture::new("preview-injected");
+        let command = parse_preview_args([fixture.path().display().to_string()])
+            .expect("default preview command should parse");
+        let mut adapter = PlanningPreviewWindowAdapter;
+        let execution = execute_preview_with_adapter(&command, &mut adapter)
+            .expect("injected preview adapter should execute");
+        let output = preview_human_summary(&command, &execution);
+
+        assert!(output.contains("Gitflux Preview complete"));
+        assert!(output.contains("Window: planned by minimal adapter (1920x1080)"));
     }
 
     #[test]

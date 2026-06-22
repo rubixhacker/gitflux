@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 gitflux-export.workspace = true
 gitflux-ingestion.workspace = true
+gitflux-preview.workspace = true
 gitflux-render.workspace = true
 gitflux-scene.workspace = true
 git2.workspace = true

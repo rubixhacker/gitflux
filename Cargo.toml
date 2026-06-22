@@ -3,6 +3,7 @@ members = [
     "crates/gitflux-cli",
     "crates/gitflux-export",
     "crates/gitflux-ingestion",
+    "crates/gitflux-preview",
     "crates/gitflux-render",
     "crates/gitflux-scene",
 ]
@@ -15,6 +16,7 @@ edition = "2021"
 [workspace.dependencies]
 gitflux-export = { path = "crates/gitflux-export" }
 gitflux-ingestion = { path = "crates/gitflux-ingestion" }
+gitflux-preview = { path = "crates/gitflux-preview" }
 gitflux-render = { path = "crates/gitflux-render" }
 gitflux-scene = { path = "crates/gitflux-scene" }
 git2 = "0.20.2"
