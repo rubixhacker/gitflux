@@ -687,9 +687,11 @@ pub struct RepositoryGraphScene {
     mainline: String,
     frame_size: SceneFrameSize,
     frames_per_second: u32,
+    explicit_path_filter: Option<SceneExplicitPathFilter>,
     contributors: Vec<SceneContributor>,
     directories: Vec<SceneDirectory>,
     files: Vec<SceneFile>,
+    visual_summaries: Vec<VisualSummary>,
     activities: Vec<SceneActivity>,
     competing_changes: Vec<SceneCompetingChange>,
 }
@@ -703,8 +705,18 @@ impl RepositoryGraphScene {
         let mut contributor_by_id = BTreeMap::<ContributorSceneId, SceneContributorSeed>::new();
         let mut directory_paths = BTreeSet::<String>::new();
         let mut file_paths = BTreeSet::<String>::new();
+        let path_filter = configuration.explicit_path_filter();
 
         for commit_event in replay.commit_events() {
+            let visible_file_changes: Vec<&FileChange> = commit_event
+                .file_changes()
+                .iter()
+                .filter(|file_change| path_filter.includes_file_change(file_change))
+                .collect();
+            if visible_file_changes.is_empty() {
+                continue;
+            }
+
             let contributor = commit_event.contributor();
             contributor_by_id
                 .entry(ContributorSceneId(contributor.identity_key().to_owned()))
@@ -713,7 +725,7 @@ impl RepositoryGraphScene {
                     kind: contributor.kind(),
                 });
 
-            for file_change in commit_event.file_changes() {
+            for file_change in visible_file_changes {
                 collect_repository_entity_paths(
                     file_change.entity(),
                     &mut directory_paths,
@@ -729,6 +741,9 @@ impl RepositoryGraphScene {
             }
         }
         for competing_change in replay.competing_changes() {
+            if !path_filter.includes_entity(competing_change.entity()) {
+                continue;
+            }
             collect_repository_entity_paths(
                 competing_change.entity(),
                 &mut directory_paths,
@@ -758,22 +773,45 @@ impl RepositoryGraphScene {
             .collect();
 
         let files = file_paths
+            .clone()
             .into_iter()
             .enumerate()
             .map(|(index, path)| SceneFile {
                 id: FileSceneId(path.clone()),
                 parent_directory_id: parent_directory_id(Path::new(&path)),
+                emphasis: SceneEmphasis::from_path(Path::new(&path)),
                 path,
                 position: ScenePosition::new(index, 2, spacing),
                 motion: MotionState::Settled,
             })
             .collect();
+        let visual_summaries = build_visual_summaries(
+            &file_paths,
+            replay,
+            path_filter,
+            configuration.level_of_detail(),
+            spacing,
+        );
 
         let activities = replay
             .commit_events()
             .iter()
+            .filter_map(|commit_event| {
+                let file_changes: Vec<SceneFileChange> = commit_event
+                    .file_changes()
+                    .iter()
+                    .filter(|file_change| path_filter.includes_file_change(file_change))
+                    .map(|file_change| {
+                        SceneFileChange::from_file_change(
+                            file_change,
+                            MotionState::from(commit_event.branch_flow()),
+                        )
+                    })
+                    .collect();
+                (!file_changes.is_empty()).then_some((commit_event, file_changes))
+            })
             .enumerate()
-            .map(|(index, commit_event)| {
+            .map(|(index, (commit_event, file_changes))| {
                 let playback_frame = u64::from(configuration.frames_per_second().get())
                     * u64::try_from(index).expect("commit index fits playback frame");
                 SceneActivity {
@@ -783,22 +821,14 @@ impl RepositoryGraphScene {
                         commit_event.contributor().identity_key().to_owned(),
                     ),
                     branch_activity: SceneBranchActivity::from(commit_event.branch_flow()),
-                    file_changes: commit_event
-                        .file_changes()
-                        .iter()
-                        .map(|file_change| {
-                            SceneFileChange::from_file_change(
-                                file_change,
-                                MotionState::from(commit_event.branch_flow()),
-                            )
-                        })
-                        .collect(),
+                    file_changes,
                 }
             })
             .collect();
         let competing_changes = replay
             .competing_changes()
             .iter()
+            .filter(|competing_change| path_filter.includes_entity(competing_change.entity()))
             .map(SceneCompetingChange::from)
             .collect();
 
@@ -809,9 +839,11 @@ impl RepositoryGraphScene {
                 height: configuration.frame_size().height(),
             },
             frames_per_second: configuration.frames_per_second().get(),
+            explicit_path_filter: path_filter.as_scene_filter(),
             contributors,
             directories,
             files,
+            visual_summaries,
             activities,
             competing_changes,
         }
@@ -841,6 +873,12 @@ impl RepositoryGraphScene {
         &self.contributors
     }
 
+    /// Returns an explicit path filter applied before scene Level of Detail.
+    #[must_use]
+    pub fn explicit_path_filter(&self) -> Option<&SceneExplicitPathFilter> {
+        self.explicit_path_filter.as_ref()
+    }
+
     /// Returns scene directories in deterministic layout order.
     #[must_use]
     pub fn directories(&self) -> &[SceneDirectory] {
@@ -851,6 +889,12 @@ impl RepositoryGraphScene {
     #[must_use]
     pub fn files(&self) -> &[SceneFile] {
         &self.files
+    }
+
+    /// Returns Visual Summaries produced by Level of Detail policy.
+    #[must_use]
+    pub fn visual_summaries(&self) -> &[VisualSummary] {
+        &self.visual_summaries
     }
 
     /// Returns timed Commit Event activity in replay order.
@@ -870,6 +914,107 @@ impl RepositoryGraphScene {
 struct SceneContributorSeed {
     display_name: String,
     kind: ContributorKind,
+}
+
+/// Explicit path scope applied before Level of Detail summarization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneExplicitPathFilter {
+    included_paths: Vec<String>,
+}
+
+impl SceneExplicitPathFilter {
+    /// Returns repository-relative path prefixes included in this scene.
+    #[must_use]
+    pub fn included_paths(&self) -> &[String] {
+        &self.included_paths
+    }
+}
+
+/// A Repository Entity that stands in for multiple underlying entities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualSummary {
+    id: VisualSummarySceneId,
+    path: String,
+    represented_file_ids: Vec<FileSceneId>,
+    represented_entity_count: usize,
+    activity_count: usize,
+    weight: VisualSummaryWeight,
+    position: ScenePosition,
+    emphasis: SceneEmphasis,
+}
+
+impl VisualSummary {
+    /// Returns the stable Visual Summary scene identifier.
+    #[must_use]
+    pub fn id(&self) -> &VisualSummarySceneId {
+        &self.id
+    }
+
+    /// Returns the repository-relative directory path represented by this summary.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns file scene identifiers represented by this Visual Summary.
+    #[must_use]
+    pub fn represented_file_ids(&self) -> &[FileSceneId] {
+        &self.represented_file_ids
+    }
+
+    /// Returns how many Repository Entities are represented.
+    #[must_use]
+    pub fn represented_entity_count(&self) -> usize {
+        self.represented_entity_count
+    }
+
+    /// Returns how many File Changes contributed to this Visual Summary.
+    #[must_use]
+    pub fn activity_count(&self) -> usize {
+        self.activity_count
+    }
+
+    /// Returns the visual weight preserved from represented activity.
+    #[must_use]
+    pub fn weight(&self) -> VisualSummaryWeight {
+        self.weight
+    }
+
+    /// Returns the deterministic scene position.
+    #[must_use]
+    pub fn position(&self) -> ScenePosition {
+        self.position
+    }
+
+    /// Returns whether this Visual Summary should be visually de-emphasized.
+    #[must_use]
+    pub fn emphasis(&self) -> SceneEmphasis {
+        self.emphasis
+    }
+}
+
+/// A stable scene identifier for a Visual Summary.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VisualSummarySceneId(String);
+
+impl VisualSummarySceneId {
+    /// Returns the stable Visual Summary scene identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Visual weight for a Visual Summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualSummaryWeight(usize);
+
+impl VisualSummaryWeight {
+    /// Returns the preserved activity weight.
+    #[must_use]
+    pub fn get(self) -> usize {
+        self.0
+    }
 }
 
 /// Output frame dimensions copied into render-ready scene data.
@@ -1040,6 +1185,7 @@ pub struct SceneFile {
     parent_directory_id: Option<DirectorySceneId>,
     position: ScenePosition,
     motion: MotionState,
+    emphasis: SceneEmphasis,
 }
 
 impl SceneFile {
@@ -1071,6 +1217,40 @@ impl SceneFile {
     #[must_use]
     pub fn motion(&self) -> MotionState {
         self.motion
+    }
+
+    /// Returns whether this file should be visually de-emphasized.
+    #[must_use]
+    pub fn emphasis(&self) -> SceneEmphasis {
+        self.emphasis
+    }
+}
+
+/// Scene-level visual emphasis for Repository Entities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneEmphasis {
+    /// Normal visual weight.
+    Normal,
+    /// Lower visual weight while preserving the Repository Entity in scene data.
+    DeEmphasized,
+}
+
+impl SceneEmphasis {
+    fn from_path(path: &Path) -> Self {
+        let path_text = path.to_string_lossy();
+        let lockfile = matches!(path_text.as_ref(), "Cargo.lock" | "package-lock.json");
+        let generated_directory = path.components().any(|component| {
+            matches!(
+                component.as_os_str().to_string_lossy().as_ref(),
+                "generated" | "target" | "vendor" | "node_modules"
+            )
+        });
+
+        if lockfile || generated_directory {
+            Self::DeEmphasized
+        } else {
+            Self::Normal
+        }
     }
 }
 
@@ -1348,6 +1528,75 @@ fn collect_repository_entity_paths(
     }
 }
 
+fn build_visual_summaries(
+    file_paths: &BTreeSet<String>,
+    replay: &RepositoryReplay,
+    path_filter: &ExplicitPathFilter,
+    level_of_detail: LevelOfDetailPolicy,
+    spacing: i32,
+) -> Vec<VisualSummary> {
+    let mut files_by_parent = BTreeMap::<String, Vec<String>>::new();
+    for file_path in file_paths {
+        if let Some(parent) = parent_directory_path(Path::new(file_path)) {
+            files_by_parent
+                .entry(parent)
+                .or_default()
+                .push(file_path.clone());
+        }
+    }
+
+    files_by_parent
+        .into_iter()
+        .filter(|(_, represented_paths)| {
+            represented_paths.len() >= level_of_detail.dense_directory_threshold().get()
+        })
+        .enumerate()
+        .map(|(index, (path, represented_paths))| {
+            let activity_count = replay
+                .commit_events()
+                .iter()
+                .flat_map(CommitEvent::file_changes)
+                .filter(|file_change| path_filter.includes_file_change(file_change))
+                .filter(|file_change| {
+                    file_change_references_any_path(file_change, &represented_paths)
+                })
+                .count();
+            let emphasis = if represented_paths.iter().all(|path| {
+                SceneEmphasis::from_path(Path::new(path)) == SceneEmphasis::DeEmphasized
+            }) {
+                SceneEmphasis::DeEmphasized
+            } else {
+                SceneEmphasis::Normal
+            };
+
+            VisualSummary {
+                id: VisualSummarySceneId(format!("summary:{path}")),
+                path,
+                represented_entity_count: represented_paths.len(),
+                activity_count,
+                weight: VisualSummaryWeight(activity_count),
+                represented_file_ids: represented_paths.into_iter().map(FileSceneId).collect(),
+                position: ScenePosition::new(index, 3, spacing),
+                emphasis,
+            }
+        })
+        .collect()
+}
+
+fn file_change_references_any_path(file_change: &FileChange, paths: &[String]) -> bool {
+    let current_path = repository_entity_path(file_change.entity());
+    paths.iter().any(|path| path == &current_path)
+        || file_change.previous_entity().is_some_and(|entity| {
+            let previous_path = repository_entity_path(entity);
+            paths.iter().any(|path| path == &previous_path)
+        })
+}
+
+fn parent_directory_path(path: &Path) -> Option<String> {
+    let parent = path.parent()?;
+    (!parent.as_os_str().is_empty()).then(|| parent.to_string_lossy().into_owned())
+}
+
 fn repository_entity_path(entity: &RepositoryEntity) -> String {
     entity.path().to_string_lossy().into_owned()
 }
@@ -1366,6 +1615,8 @@ pub struct RenderConfiguration {
     frames_per_second: FramesPerSecond,
     theme: Theme,
     layout: Layout,
+    level_of_detail: LevelOfDetailPolicy,
+    explicit_path_filter: ExplicitPathFilter,
 }
 
 impl RenderConfiguration {
@@ -1378,6 +1629,8 @@ impl RenderConfiguration {
             frames_per_second: FramesPerSecond::new(60).expect("default FPS is valid"),
             theme,
             layout,
+            level_of_detail: LevelOfDetailPolicy::default(),
+            explicit_path_filter: ExplicitPathFilter::default(),
         }
     }
 
@@ -1424,6 +1677,18 @@ impl RenderConfiguration {
         &self.layout
     }
 
+    /// Returns the Level of Detail policy for scene summarization.
+    #[must_use]
+    pub fn level_of_detail(&self) -> LevelOfDetailPolicy {
+        self.level_of_detail
+    }
+
+    /// Returns explicit repository path filters applied before Level of Detail.
+    #[must_use]
+    pub fn explicit_path_filter(&self) -> &ExplicitPathFilter {
+        &self.explicit_path_filter
+    }
+
     fn try_from_raw(raw: RawRenderConfiguration) -> Result<Self, RenderConfigurationError> {
         let mut errors = RenderConfigurationError::new();
 
@@ -1450,6 +1715,8 @@ impl RenderConfiguration {
 
         let theme = Theme::try_from_raw(raw.theme, &mut errors);
         let layout = Layout::try_from_raw(raw.layout, &mut errors);
+        let level_of_detail = LevelOfDetailPolicy::try_from_raw(raw.level_of_detail, &mut errors);
+        let explicit_path_filter = ExplicitPathFilter::try_from_raw(raw.filters, &mut errors);
 
         if errors.is_empty() {
             Ok(Self {
@@ -1458,6 +1725,8 @@ impl RenderConfiguration {
                 frames_per_second: frames_per_second.expect("validated FPS"),
                 theme: theme.expect("validated Theme"),
                 layout: layout.expect("validated Layout"),
+                level_of_detail: level_of_detail.expect("validated Level of Detail"),
+                explicit_path_filter: explicit_path_filter.expect("validated explicit filters"),
             })
         } else {
             Err(errors)
@@ -1473,6 +1742,8 @@ impl Default for RenderConfiguration {
             frames_per_second: FramesPerSecond::new(60).expect("default FPS is valid"),
             theme: Theme::default(),
             layout: Layout::RepositoryGraphWithParameters(RepositoryGraphLayout::default()),
+            level_of_detail: LevelOfDetailPolicy::default(),
+            explicit_path_filter: ExplicitPathFilter::default(),
         }
     }
 }
@@ -1751,6 +2022,132 @@ impl Default for RepositoryGraphLayout {
     }
 }
 
+/// A render policy that summarizes dense Repository Entities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelOfDetailPolicy {
+    dense_directory_threshold: EntityCountThreshold,
+}
+
+impl LevelOfDetailPolicy {
+    /// Returns the file count at which a directory receives a Visual Summary.
+    #[must_use]
+    pub fn dense_directory_threshold(self) -> EntityCountThreshold {
+        self.dense_directory_threshold
+    }
+
+    fn try_from_raw(
+        raw: Option<RawLevelOfDetailPolicy>,
+        errors: &mut RenderConfigurationError,
+    ) -> Option<Self> {
+        let Some(raw) = raw else {
+            return Some(Self::default());
+        };
+        let dense_directory_threshold =
+            match EntityCountThreshold::new(raw.dense_directory_threshold) {
+                Ok(threshold) => Some(threshold),
+                Err(ConfigValueError) => {
+                    errors.push(
+                        "level_of_detail.dense_directory_threshold",
+                        "positive integer",
+                    );
+                    None
+                }
+            };
+
+        Some(Self {
+            dense_directory_threshold: dense_directory_threshold?,
+        })
+    }
+}
+
+impl Default for LevelOfDetailPolicy {
+    fn default() -> Self {
+        Self {
+            dense_directory_threshold: EntityCountThreshold::new(5)
+                .expect("default dense directory threshold is valid"),
+        }
+    }
+}
+
+/// Positive Repository Entity count threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityCountThreshold(usize);
+
+impl EntityCountThreshold {
+    /// Creates a positive entity count threshold.
+    pub fn new(value: usize) -> Result<Self, ConfigValueError> {
+        if value == 0 {
+            Err(ConfigValueError)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the threshold value.
+    #[must_use]
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Explicit path filters that scope the Repository Replay before summarization.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExplicitPathFilter {
+    included_paths: Vec<PathBuf>,
+}
+
+impl ExplicitPathFilter {
+    /// Returns true when no explicit path scope is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.included_paths.is_empty()
+    }
+
+    /// Returns configured repository-relative included paths.
+    #[must_use]
+    pub fn included_paths(&self) -> &[PathBuf] {
+        &self.included_paths
+    }
+
+    fn includes_file_change(&self, file_change: &FileChange) -> bool {
+        self.includes_entity(file_change.entity())
+            || file_change
+                .previous_entity()
+                .is_some_and(|entity| self.includes_entity(entity))
+    }
+
+    fn includes_entity(&self, entity: &RepositoryEntity) -> bool {
+        self.is_empty()
+            || self
+                .included_paths
+                .iter()
+                .any(|included_path| entity.path().starts_with(included_path))
+    }
+
+    fn as_scene_filter(&self) -> Option<SceneExplicitPathFilter> {
+        (!self.is_empty()).then(|| SceneExplicitPathFilter {
+            included_paths: self
+                .included_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        })
+    }
+
+    fn try_from_raw(
+        raw: Option<RawExplicitPathFilter>,
+        _errors: &mut RenderConfigurationError,
+    ) -> Option<Self> {
+        let Some(raw) = raw else {
+            return Some(Self::default());
+        };
+
+        Some(Self {
+            included_paths: raw.included_paths.into_iter().map(PathBuf::from).collect(),
+        })
+    }
+}
+
 /// Spacing between Repository Entities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntitySpacing(u32);
@@ -1854,6 +2251,8 @@ struct RawRenderConfiguration {
     frames_per_second: u32,
     theme: RawTheme,
     layout: RawLayout,
+    level_of_detail: Option<RawLevelOfDetailPolicy>,
+    filters: Option<RawExplicitPathFilter>,
 }
 
 struct RawTheme {
@@ -1867,6 +2266,14 @@ struct RawLayout {
     kind: String,
     entity_spacing: u32,
     settle_iterations: u32,
+}
+
+struct RawLevelOfDetailPolicy {
+    dense_directory_threshold: usize,
+}
+
+struct RawExplicitPathFilter {
+    included_paths: Vec<String>,
 }
 
 impl RawRenderConfiguration {
@@ -1889,6 +2296,8 @@ impl RawRenderConfiguration {
                 "frames_per_second",
                 "theme",
                 "layout",
+                "level_of_detail",
+                "filters",
             ],
             &mut errors,
         );
@@ -1899,6 +2308,9 @@ impl RawRenderConfiguration {
             u32_field(table, "frames_per_second", "frames_per_second", &mut errors);
         let theme = RawTheme::try_from_field(table.get("theme"), &mut errors);
         let layout = RawLayout::try_from_field(table.get("layout"), &mut errors);
+        let level_of_detail =
+            RawLevelOfDetailPolicy::try_from_field(table.get("level_of_detail"), &mut errors);
+        let filters = RawExplicitPathFilter::try_from_field(table.get("filters"), &mut errors);
 
         if errors.is_empty() {
             Ok(Self {
@@ -1907,6 +2319,8 @@ impl RawRenderConfiguration {
                 frames_per_second: frames_per_second.expect("validated FPS"),
                 theme: theme.expect("validated Theme section"),
                 layout: layout.expect("validated Layout section"),
+                level_of_detail,
+                filters,
             })
         } else {
             Err(errors)
@@ -2010,6 +2424,59 @@ impl RawLayout {
     }
 }
 
+impl RawLevelOfDetailPolicy {
+    fn try_from_field(
+        value: Option<&Value>,
+        errors: &mut RenderConfigurationError,
+    ) -> Option<Self> {
+        let value = value?;
+        let Some(table) = value.as_table() else {
+            errors.push("level_of_detail", "table with Level of Detail fields");
+            return None;
+        };
+
+        report_unknown_fields(
+            table,
+            "level_of_detail",
+            &["dense_directory_threshold"],
+            errors,
+        );
+
+        let dense_directory_threshold = usize_field(
+            table,
+            "dense_directory_threshold",
+            "level_of_detail.dense_directory_threshold",
+            errors,
+        );
+
+        Some(Self {
+            dense_directory_threshold: dense_directory_threshold?,
+        })
+    }
+}
+
+impl RawExplicitPathFilter {
+    fn try_from_field(
+        value: Option<&Value>,
+        errors: &mut RenderConfigurationError,
+    ) -> Option<Self> {
+        let value = value?;
+        let Some(table) = value.as_table() else {
+            errors.push("filters", "table with filter fields");
+            return None;
+        };
+
+        report_unknown_fields(table, "filters", &["included_paths"], errors);
+
+        let included_paths =
+            string_array_field(table, "included_paths", "filters.included_paths", errors);
+
+        Some(Self {
+            included_paths: included_paths?,
+        })
+    }
+}
+
 fn report_unknown_fields(
     table: &toml::map::Map<String, Value>,
     prefix: &str,
@@ -2044,6 +2511,22 @@ fn u32_field(
     })
 }
 
+fn usize_field(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    field: &'static str,
+    errors: &mut RenderConfigurationError,
+) -> Option<usize> {
+    match table.get(key) {
+        Some(Value::Integer(value)) => usize::try_from(*value).ok(),
+        Some(_) | None => None,
+    }
+    .or_else(|| {
+        errors.push(field, "positive integer");
+        None
+    })
+}
+
 fn string_field(
     table: &toml::map::Map<String, Value>,
     key: &str,
@@ -2058,6 +2541,28 @@ fn string_field(
             None
         }
     }
+}
+
+fn string_array_field(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    field: &'static str,
+    errors: &mut RenderConfigurationError,
+) -> Option<Vec<String>> {
+    match table.get(key) {
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                Value::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>(),
+        Some(_) | None => None,
+    }
+    .or_else(|| {
+        errors.push(field, "array of repository-relative path strings");
+        None
+    })
 }
 
 fn parse_hex_color(
@@ -2326,6 +2831,7 @@ frame_height =
         height: 1080,
     },
     frames_per_second: 60,
+    explicit_path_filter: None,
     contributors: [
         SceneContributor {
             id: ContributorSceneId(
@@ -2374,6 +2880,7 @@ frame_height =
                 y: 240,
             },
             motion: Settled,
+            emphasis: Normal,
         },
         SceneFile {
             id: FileSceneId(
@@ -2390,8 +2897,10 @@ frame_height =
                 y: 240,
             },
             motion: Settled,
+            emphasis: Normal,
         },
     ],
+    visual_summaries: [],
     activities: [
         SceneActivity {
             commit_id: CommitSceneId(
@@ -2525,6 +3034,7 @@ frame_height =
         height: 1080,
     },
     frames_per_second: 60,
+    explicit_path_filter: None,
     contributors: [
         SceneContributor {
             id: ContributorSceneId(
@@ -2566,8 +3076,10 @@ frame_height =
                 y: 240,
             },
             motion: Settled,
+            emphasis: Normal,
         },
     ],
+    visual_summaries: [],
     activities: [
         SceneActivity {
             commit_id: CommitSceneId(
@@ -2670,5 +3182,624 @@ frame_height =
     ],
 }"#
         );
+    }
+
+    #[test]
+    fn repository_graph_scene_summarizes_dense_directory_with_activity_weight() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        let dense_changes = (0..5)
+            .map(|index| {
+                FileChange::new(
+                    RepositoryEntity::new(format!("src/generated/file_{index}.rs")),
+                    FileChangeKind::Modified,
+                )
+            })
+            .collect();
+
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("dense"),
+            Contributor::automation("Generator"),
+            dense_changes,
+        ));
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &RenderConfiguration::default());
+
+        assert_eq!(
+            format!("{scene:#?}"),
+            r#"RepositoryGraphScene {
+    mainline: "main",
+    frame_size: SceneFrameSize {
+        width: 1920,
+        height: 1080,
+    },
+    frames_per_second: 60,
+    explicit_path_filter: None,
+    contributors: [
+        SceneContributor {
+            id: ContributorSceneId(
+                "Generator",
+            ),
+            display_name: "Generator",
+            kind: Automation,
+            position: ScenePosition {
+                x: 0,
+                y: 0,
+            },
+        },
+    ],
+    directories: [
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src",
+            ),
+            path: "src",
+            position: ScenePosition {
+                x: 0,
+                y: 120,
+            },
+        },
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src/generated",
+            ),
+            path: "src/generated",
+            position: ScenePosition {
+                x: 120,
+                y: 120,
+            },
+        },
+    ],
+    files: [
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_0.rs",
+            ),
+            path: "src/generated/file_0.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_1.rs",
+            ),
+            path: "src/generated/file_1.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 120,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_2.rs",
+            ),
+            path: "src/generated/file_2.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 240,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_3.rs",
+            ),
+            path: "src/generated/file_3.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 360,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/generated/file_4.rs",
+            ),
+            path: "src/generated/file_4.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/generated",
+                ),
+            ),
+            position: ScenePosition {
+                x: 480,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: DeEmphasized,
+        },
+    ],
+    visual_summaries: [
+        VisualSummary {
+            id: VisualSummarySceneId(
+                "summary:src/generated",
+            ),
+            path: "src/generated",
+            represented_file_ids: [
+                FileSceneId(
+                    "src/generated/file_0.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_1.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_2.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_3.rs",
+                ),
+                FileSceneId(
+                    "src/generated/file_4.rs",
+                ),
+            ],
+            represented_entity_count: 5,
+            activity_count: 5,
+            weight: VisualSummaryWeight(
+                5,
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 360,
+            },
+            emphasis: DeEmphasized,
+        },
+    ],
+    activities: [
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "dense",
+            ),
+            playback_frame: 0,
+            contributor_id: ContributorSceneId(
+                "Generator",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_0.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Modified,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_1.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Modified,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_2.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Modified,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_3.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Modified,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/generated/file_4.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Modified,
+                    motion: Settled,
+                },
+            ],
+        },
+    ],
+    competing_changes: [],
+}"#
+        );
+    }
+
+    #[test]
+    fn explicit_path_filter_scopes_scene_before_visual_summary() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        let mut file_changes = (0..5)
+            .map(|index| {
+                FileChange::new(
+                    RepositoryEntity::new(format!("src/app/file_{index}.rs")),
+                    FileChangeKind::Added,
+                )
+            })
+            .collect::<Vec<_>>();
+        file_changes.push(FileChange::new(
+            RepositoryEntity::new("docs/guide.md"),
+            FileChangeKind::Added,
+        ));
+        file_changes.push(FileChange::new(
+            RepositoryEntity::new("tests/app_test.rs"),
+            FileChangeKind::Added,
+        ));
+
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("mixed"),
+            Contributor::human("Ada"),
+            file_changes,
+        ));
+
+        let config = RenderConfiguration::from_toml_str(
+            r##"
+frame_width = 1920
+frame_height = 1080
+frames_per_second = 60
+
+[theme]
+name = "gitflux-dark"
+background_color = "#0b1020"
+entity_color = "#7dd3fc"
+contributor_color = "#facc15"
+
+[layout]
+kind = "repository_graph"
+entity_spacing = 120
+settle_iterations = 60
+
+[filters]
+included_paths = ["src/app"]
+"##,
+        )
+        .expect("explicit path filter should parse");
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &config);
+
+        assert_eq!(
+            format!("{scene:#?}"),
+            r#"RepositoryGraphScene {
+    mainline: "main",
+    frame_size: SceneFrameSize {
+        width: 1920,
+        height: 1080,
+    },
+    frames_per_second: 60,
+    explicit_path_filter: Some(
+        SceneExplicitPathFilter {
+            included_paths: [
+                "src/app",
+            ],
+        },
+    ),
+    contributors: [
+        SceneContributor {
+            id: ContributorSceneId(
+                "Ada",
+            ),
+            display_name: "Ada",
+            kind: Human,
+            position: ScenePosition {
+                x: 0,
+                y: 0,
+            },
+        },
+    ],
+    directories: [
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src",
+            ),
+            path: "src",
+            position: ScenePosition {
+                x: 0,
+                y: 120,
+            },
+        },
+        SceneDirectory {
+            id: DirectorySceneId(
+                "src/app",
+            ),
+            path: "src/app",
+            position: ScenePosition {
+                x: 120,
+                y: 120,
+            },
+        },
+    ],
+    files: [
+        SceneFile {
+            id: FileSceneId(
+                "src/app/file_0.rs",
+            ),
+            path: "src/app/file_0.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/app",
+                ),
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/app/file_1.rs",
+            ),
+            path: "src/app/file_1.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/app",
+                ),
+            ),
+            position: ScenePosition {
+                x: 120,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/app/file_2.rs",
+            ),
+            path: "src/app/file_2.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/app",
+                ),
+            ),
+            position: ScenePosition {
+                x: 240,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/app/file_3.rs",
+            ),
+            path: "src/app/file_3.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/app",
+                ),
+            ),
+            position: ScenePosition {
+                x: 360,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+        SceneFile {
+            id: FileSceneId(
+                "src/app/file_4.rs",
+            ),
+            path: "src/app/file_4.rs",
+            parent_directory_id: Some(
+                DirectorySceneId(
+                    "src/app",
+                ),
+            ),
+            position: ScenePosition {
+                x: 480,
+                y: 240,
+            },
+            motion: Settled,
+            emphasis: Normal,
+        },
+    ],
+    visual_summaries: [
+        VisualSummary {
+            id: VisualSummarySceneId(
+                "summary:src/app",
+            ),
+            path: "src/app",
+            represented_file_ids: [
+                FileSceneId(
+                    "src/app/file_0.rs",
+                ),
+                FileSceneId(
+                    "src/app/file_1.rs",
+                ),
+                FileSceneId(
+                    "src/app/file_2.rs",
+                ),
+                FileSceneId(
+                    "src/app/file_3.rs",
+                ),
+                FileSceneId(
+                    "src/app/file_4.rs",
+                ),
+            ],
+            represented_entity_count: 5,
+            activity_count: 5,
+            weight: VisualSummaryWeight(
+                5,
+            ),
+            position: ScenePosition {
+                x: 0,
+                y: 360,
+            },
+            emphasis: Normal,
+        },
+    ],
+    activities: [
+        SceneActivity {
+            commit_id: CommitSceneId(
+                "mixed",
+            ),
+            playback_frame: 0,
+            contributor_id: ContributorSceneId(
+                "Ada",
+            ),
+            branch_activity: Mainline,
+            file_changes: [
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/app/file_0.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/app/file_1.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/app/file_2.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/app/file_3.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+                SceneFileChange {
+                    file_id: FileSceneId(
+                        "src/app/file_4.rs",
+                    ),
+                    previous_file_id: None,
+                    kind: Added,
+                    motion: Settled,
+                },
+            ],
+        },
+    ],
+    competing_changes: [],
+}"#
+        );
+    }
+
+    #[test]
+    fn generated_vendor_and_lockfile_paths_are_de_emphasized_without_exclusion() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("deps"),
+            Contributor::automation("Dependency update"),
+            vec![
+                FileChange::new(
+                    RepositoryEntity::new("target/cache.bin"),
+                    FileChangeKind::Added,
+                ),
+                FileChange::new(
+                    RepositoryEntity::new("vendor/lib.rs"),
+                    FileChangeKind::Added,
+                ),
+                FileChange::new(
+                    RepositoryEntity::new("node_modules/pkg/index.js"),
+                    FileChangeKind::Added,
+                ),
+                FileChange::new(
+                    RepositoryEntity::new("Cargo.lock"),
+                    FileChangeKind::Modified,
+                ),
+                FileChange::new(
+                    RepositoryEntity::new("package-lock.json"),
+                    FileChangeKind::Modified,
+                ),
+                FileChange::new(
+                    RepositoryEntity::new("src/generated/file.rs"),
+                    FileChangeKind::Modified,
+                ),
+                FileChange::new(
+                    RepositoryEntity::new("src/lib.rs"),
+                    FileChangeKind::Modified,
+                ),
+            ],
+        ));
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &RenderConfiguration::default());
+        let snapshot = format!("{scene:#?}");
+
+        assert!(snapshot.contains("target/cache.bin"));
+        assert!(snapshot.contains("vendor/lib.rs"));
+        assert!(snapshot.contains("node_modules/pkg/index.js"));
+        assert!(snapshot.contains("Cargo.lock"));
+        assert!(snapshot.contains("package-lock.json"));
+        assert!(snapshot.contains("src/generated/file.rs"));
+        assert!(snapshot.contains("src/lib.rs"));
+        assert_eq!(snapshot.matches("emphasis: DeEmphasized").count(), 6);
+        assert!(snapshot.contains("emphasis: Normal"));
+    }
+
+    #[test]
+    fn visual_summary_counts_move_activity_from_previous_entity() {
+        let mut replay = RepositoryReplay::new(Mainline::new("main"));
+        let dense_changes = (0..5)
+            .map(|index| {
+                FileChange::new(
+                    RepositoryEntity::new(format!("src/old/file_{index}.rs")),
+                    FileChangeKind::Added,
+                )
+            })
+            .collect();
+
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("base"),
+            Contributor::human("Ada"),
+            dense_changes,
+        ));
+        replay.push_commit_event(CommitEvent::new(
+            CommitId::new("move"),
+            Contributor::human("Ada"),
+            vec![FileChange::moved(
+                RepositoryEntity::new("src/old/file_0.rs"),
+                RepositoryEntity::new("src/new/file_0.rs"),
+            )],
+        ));
+
+        let scene = RepositoryGraphScene::from_replay(&replay, &RenderConfiguration::default());
+        let old_summary = scene
+            .visual_summaries()
+            .iter()
+            .find(|summary| summary.path() == "src/old")
+            .expect("source directory should remain summarized");
+
+        assert_eq!(old_summary.represented_entity_count(), 5);
+        assert_eq!(old_summary.activity_count(), 6);
+        assert_eq!(old_summary.weight().get(), 6);
     }
 }
